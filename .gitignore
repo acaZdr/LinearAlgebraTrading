@@ -144,3 +144,5 @@ cython_debug/
 
 # Jetbrains
 .idea/
+
+config.py

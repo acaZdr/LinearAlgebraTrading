@@ -1,0 +1,13 @@
+# config.yaml
+train_data_path: 'data/BTCUSDT-1s-2023-11.csv'
+val_data_path: 'data/BTCUSDT-1s-2023-12.csv'
+test_data_path: 'data/BTCUSDT-1s-2024-01.csv'
+data_limit: 1000000
+target: 'Close'
+seq_length: 60
+batch_size: 32
+hidden_dim: 64
+num_layers: 3
+learning_rate: 0.001
+num_epochs: 10
+dropout: 0.3

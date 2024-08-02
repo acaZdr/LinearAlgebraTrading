@@ -1,6 +1,7 @@
 import numpy as np
 from sklearn.decomposition import PCA
 
+
 def perform_svd(df):
     # Select Columns for Analysis
     indicator_cols = ['SMA_10', 'SMA_50', 'EMA_20', 'RSI_14', 'MACD', 'BB_High', 'BB_Low', 'ATR_14']
@@ -13,9 +14,10 @@ def perform_svd(df):
     U, S, VT = np.linalg.svd(indicator_matrix_std, full_matrices=False)
 
     # Analyze singular values for explained variance
-    print("Explained Variance Per Component:", S**2 / np.sum(S**2))
+    print("Explained Variance Per Component:", S ** 2 / np.sum(S ** 2))
 
     return U, S, VT
+
 
 def perform_pca(df, n_components=3):
     # Select Columns for Analysis

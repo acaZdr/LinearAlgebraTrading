@@ -1,8 +1,7 @@
 import os
 import zipfile
+from config import download_dir as rootDir
 
-# Specify the directory you want to start from
-rootDir = '/Users/aleksandarzdravkovic/PycharmProjects/LinearAlgebraTrading/data'
 
 def run():
     for dirName, subdirList, fileList in os.walk(rootDir):
@@ -22,6 +21,7 @@ def run():
                         continue
                 else:
                     print(f'\tFile {fname} already extracted.')
+
 
 if __name__ == '__main__':
     run()
