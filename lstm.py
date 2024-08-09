@@ -13,6 +13,22 @@ import traceback
 from data_preprocessing import import_data
 import torch.optim.lr_scheduler as lr_scheduler
 
+A# Set up the results subfolder
+subfolder = 'results'
+if not os.path.exists(subfolder):
+    os.makedirs(subfolder)
+
+
+class Attention(nn.Module):
+    def __init__(self, hidden_dim):
+        super(Attention, self).__init__()
+        self.attention = nn.Linear(hidden_dim, 1, bias=False)
+
+    def forward(self, lstm_out):
+        attention_weights = torch.softmax(self.attention(lstm_out).squeeze(-1), dim=1)
+        context_vector = torch.sum(attention_weights.unsqueeze(-1) * lstm_out, dim=1)
+        return context_vector, attention_weights
+
 
 # Define the LSTM model
 class LSTMModel(nn.Module):
@@ -22,17 +38,20 @@ class LSTMModel(nn.Module):
         self.num_layers = num_layers
 
         self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout)
+        self.attention = Attention(hidden_dim)
         self.fc = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, x):
         h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).to(x.device)
         c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).to(x.device)
-        out, _ = self.lstm(x, (h0, c0))
-        out = self.fc(out[:, -1, :])
-        return out
+        lstm_out, _ = self.lstm(x, (h0, c0))
+        context_vector, attention_weights = self.attention(lstm_out)
+        out = self.fc(context_vector)
+        return out.view(-1, 1), attention_weights
+
+    # Custom dataset
 
 
-# Custom dataset
 class CryptoDataset(Dataset):
     def __init__(self, data, seq_length):
         self.data = torch.FloatTensor(data)
@@ -110,8 +129,8 @@ def preprocess_data(data, config):
     X_scaled = scaler_X.fit_transform(X)
 
     # Check if PCA components file exists
-    pca_file = 'pca_components.npy'
-    pca_mean_file = 'pca_mean.npy'
+    pca_file = os.path.join(subfolder, 'pca_components.npy')
+    pca_mean_file = os.path.join(subfolder, 'pca_mean.npy')
     if os.path.exists(pca_file) and os.path.exists(pca_mean_file):
         pca_components = np.load(pca_file)
         pca_mean = np.load(pca_mean_file)
@@ -127,7 +146,7 @@ def preprocess_data(data, config):
         X_pca = pca.fit_transform(X_scaled)
         np.save(pca_file, pca.components_)
         np.save(pca_mean_file, pca.mean_)
-        logging.info("PCA components and mean saved as 'pca_components.npy' and 'pca_mean.npy'")
+        logging.info(f"PCA components and mean saved as '{pca_file}' and '{pca_mean_file}'")
 
     final_features = [f"Component_{i + 1}" for i in range(n_components)]
     logging.info(f"Final features used by the NN: {final_features}")
@@ -154,8 +173,8 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         for X_batch, y_batch in train_loader:
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
             optimizer.zero_grad()
-            y_pred = model(X_batch)
-            loss = criterion(y_pred.squeeze(), y_batch)
+            y_pred, _ = model(X_batch)  # Extract the predictions
+            loss = criterion(y_pred.squeeze(), y_batch)  # Apply squeeze only to y_pred
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
@@ -165,8 +184,8 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         with torch.no_grad():
             for X_batch, y_batch in val_loader:
                 X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-                y_pred = model(X_batch)
-                loss = criterion(y_pred.squeeze(), y_batch)
+                y_pred, _ = model(X_batch)  # Extract the predictions
+                loss = criterion(y_pred.squeeze(), y_batch)  # Apply squeeze only to y_pred
                 val_loss += loss.item()
 
         train_loss /= len(train_loader)
@@ -180,13 +199,35 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
-            torch.save(model.state_dict(), 'best_lstm_model.pth')
+            torch.save(model.state_dict(), os.path.join(subfolder, 'best_lstm_model.pth'))
         else:
             patience_counter += 1
 
         if patience_counter >= patience:
             print("Early stopping triggered")
             break
+
+
+def evaluate_dollar_difference(model, data_loader, scaler_y, device):
+    model.eval()
+    total_abs_error = 0
+    count = 0
+
+    with torch.no_grad():
+        for X_batch, y_batch in data_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            y_pred, _ = model(X_batch)
+
+            # Convert predictions and targets back to the original scale
+            y_pred_unscaled = scaler_y.inverse_transform(y_pred.cpu().numpy().reshape(-1, 1))
+            y_batch_unscaled = scaler_y.inverse_transform(y_batch.cpu().numpy().reshape(-1, 1))
+
+            # Calculate the absolute error
+            total_abs_error += np.sum(np.abs(y_pred_unscaled - y_batch_unscaled))
+            count += len(y_batch)
+
+    average_dollar_diff = total_abs_error / count
+    return average_dollar_diff
 
 
 def main(config_path):
@@ -204,6 +245,7 @@ def main(config_path):
 
         processed_data = {}
         data_loaders = {}
+        scaler_y = None
 
         for dataset_name, data_path in datasets.items():
             # Load data
@@ -232,74 +274,58 @@ def main(config_path):
                 logging.warning(f"Initial {dataset_name} data contains infinite values")
 
             # Preprocess data
-            try:
-                processed_data[dataset_name], pca = preprocess_data(data, config)
-                logging.info(
-                    f"{dataset_name.capitalize()} data preprocessed. Shape: {processed_data[dataset_name].shape}")
-            except ValueError as ve:
-                logging.error(f"Error in {dataset_name} data preprocessing: {str(ve)}")
-                return
+            processed_data[dataset_name], pca = preprocess_data(data, config)
+            logging.info(
+                f"{dataset_name.capitalize()} data preprocessed successfully. Shape: {processed_data[dataset_name].shape}")
 
-            # Prepare dataset
-            seq_length = config['seq_length']
-            dataset = CryptoDataset(processed_data[dataset_name], seq_length)
-            data_loaders[dataset_name] = DataLoader(dataset, batch_size=config['batch_size'],
-                                                    shuffle=(dataset_name == 'train'))
+            # Create datasets and dataloaders
+            dataset = CryptoDataset(processed_data[dataset_name], seq_length=config['seq_length'])
+            data_loaders[dataset_name] = DataLoader(dataset, batch_size=config['batch_size'], shuffle=True)
 
-        # Initialize model
-        input_dim = processed_data['train'].shape[1] - 1  # Exclude the target column
-        model = LSTMModel(input_dim, config['hidden_dim'], config['num_layers'], 1, dropout=config['dropout'])
+            if dataset_name == 'train':
+                # Extract the target scaler from the training data
+                _, scaler_y = preprocess_data(data, config)
 
+        # Initialize the model
+        input_dim = processed_data['train'].shape[1] - 1
+        model = LSTMModel(input_dim=input_dim, hidden_dim=config['hidden_dim'],
+                          num_layers=config['num_layers'], output_dim=1, dropout=config['dropout'])
+
+        # Define the loss function and optimizer
         criterion = nn.MSELoss()
-        optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=1e-5)
+        optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'])
+        scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
 
-        # Create a learning rate scheduler
-        scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=3, verbose=True)
+        # Train the model
+        train_model(model, data_loaders['train'], data_loaders['val'], criterion, optimizer, scheduler,
+                    config['num_epochs'], torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
 
-        # Train model
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        train_model(model, data_loaders['train'], data_loaders['val'], criterion, optimizer, scheduler, config['num_epochs'], device)
-
-        # Save model
-        torch.save(model.state_dict(), 'lstm_model.pth')
-        logging.info("Model saved as 'lstm_model.pth'")
-
-        # Save PCA components
-        np.save('pca_components.npy', pca.components_)
-        logging.info("PCA components saved as 'pca_components.npy'")
-
-        # Load the trained model for testing
-        model = LSTMModel(input_dim, config['hidden_dim'], config['num_layers'], 1, dropout=config['dropout'])
-        model.load_state_dict(torch.load('best_lstm_model.pth'))
-        model.to(device)
+        # Evaluate the model on the test set
+        model.load_state_dict(torch.load(os.path.join(subfolder, 'best_lstm_model.pth')))
         model.eval()
-
-        # Evaluate on test data
         test_loss = 0
-        predictions = []
-        actuals = []
         with torch.no_grad():
             for X_batch, y_batch in data_loaders['test']:
-                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-                y_pred = model(X_batch)
+                X_batch, y_batch = X_batch.to(torch.device('cuda' if torch.cuda.is_available() else 'cpu')), y_batch.to(
+                    torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+                y_pred, _ = model(X_batch)
                 loss = criterion(y_pred.squeeze(), y_batch)
                 test_loss += loss.item()
-                predictions.extend(y_pred.cpu().numpy())
-                actuals.extend(y_batch.cpu().numpy())
-
         test_loss /= len(data_loaders['test'])
-        print(f"Test Loss: {test_loss:.4f}")
-        logging.info(f"Test Loss: {test_loss:.4f}")
+        logging.info(f'Test Loss: {test_loss:.4f}')
+        print(f"y_pred shape: {y_pred.shape}")
+        print(f"scaler_y mean shape: {scaler_y.mean_.shape}")  # This assumes `scaler_y` is a StandardScaler
 
-        # Save predictions
-        np.save('test_predictions.npy', np.array(predictions))
-        np.save('test_actuals.npy', np.array(actuals))
-        logging.info("Test predictions and actuals saved as 'test_predictions.npy' and 'test_actuals.npy'")
+        average_dollar_difference = evaluate_dollar_difference(model, data_loaders['test'], scaler_y,
+                                                               torch.device(
+                                                                   'cuda' if torch.cuda.is_available() else 'cpu'))
+        logging.info(f'Average Dollar Difference: ${average_dollar_difference:.2f}')
 
     except Exception as e:
         logging.error(f"An error occurred: {str(e)}")
-        logging.error(f"Error traceback: {traceback.format_exc()}")
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
-    main('config.yaml')
+    config_path = 'config.yaml'
+    main(config_path)
