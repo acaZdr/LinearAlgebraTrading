@@ -2,6 +2,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 from ta import add_all_ta_features
+from ta.momentum import RSIIndicator
+from ta.trend import MACD, EMAIndicator
+from ta.volatility import BollingerBands
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
@@ -13,10 +16,32 @@ import traceback
 from data_preprocessing import import_data
 import torch.optim.lr_scheduler as lr_scheduler
 
-A# Set up the results subfolder
+# Set up the results subfolder
 subfolder = 'results'
 if not os.path.exists(subfolder):
     os.makedirs(subfolder)
+device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+
+
+def add_lookback_ta_features(df):
+    # Add Bollinger Bands
+    indicator_bb = BollingerBands(close=df["Close"], window=20, window_dev=2)
+    df['bb_high'] = indicator_bb.bollinger_hband()
+    df['bb_low'] = indicator_bb.bollinger_lband()
+
+    # Add MACD
+    indicator_macd = MACD(close=df["Close"])
+    df['macd'] = indicator_macd.macd()
+    df['macd_signal'] = indicator_macd.macd_signal()
+
+    # Add EMA
+    df['ema_12'] = EMAIndicator(close=df["Close"], window=12).ema_indicator()
+    df['ema_26'] = EMAIndicator(close=df["Close"], window=26).ema_indicator()
+
+    # Add RSI
+    df['rsi'] = RSIIndicator(close=df["Close"]).rsi()
+
+    return df
 
 
 class Attention(nn.Module):
@@ -91,76 +116,38 @@ def choose_n_components(X_scaled, variance_threshold=0.95):
 
 
 def preprocess_data(data, config):
-    """Preprocess the data by calculating technical indicators, selecting features, and applying PCA."""
-    # Calculate technical indicators
-    data = add_all_ta_features(
-        data, open="Open", high="High", low="Low", close="Close", volume="Volume")
-
-    # Drop OHLCV columns from the dataset
-    data = data.drop(columns=['Open', 'High', 'Low', 'Volume'])
-
-    # Select the target column
+    # Shift the target variable
     target = config['target']
+    data['target'] = data[target].shift(-1)  # Shift the target to predict next second's close
 
-    # Ensure the target column is present
-    if target not in data.columns:
-        raise ValueError(f"Target column '{target}' is missing in the dataset")
+    # Calculate lookback technical indicators
+    data = add_lookback_ta_features(data)
 
-    # Replace infinite values with NaNs
-    data.replace([np.inf, -np.inf], np.nan, inplace=True)
+    # Drop the last row as it won't have a target value
+    data = data.dropna().reset_index(drop=True)
 
-    # Drop columns with NaN values
-    data = data.dropna(axis=1, how='any')
+    # Drop OHLCV columns from the dataset, keeping only the indicators and target
+    feature_columns = ['bb_high', 'bb_low', 'macd', 'macd_signal', 'ema_12', 'ema_26', 'rsi']
 
-    # Check if there is any data left after dropping columns
-    if data.empty or data.shape[1] <= 1:
-        raise ValueError("No data available after dropping columns with NaN values")
+    # Ensure all feature columns exist in the dataframe
+    feature_columns = [col for col in feature_columns if col in data.columns]
 
-    # Split combined data back into features and target
-    X = data.drop(columns=[target]).values
-    y = data[target].values
-
-    # Check for any remaining NaN values in features
-    if np.isnan(X).any():
-        raise ValueError("Input X contains NaN values after replacing infinities")
+    X = data[feature_columns].values
+    y = data['target'].values
 
     # Standardize the features
     scaler_X = StandardScaler()
     X_scaled = scaler_X.fit_transform(X)
 
-    # Check if PCA components file exists
-    pca_file = os.path.join(subfolder, 'pca_components.npy')
-    pca_mean_file = os.path.join(subfolder, 'pca_mean.npy')
-    if os.path.exists(pca_file) and os.path.exists(pca_mean_file):
-        pca_components = np.load(pca_file)
-        pca_mean = np.load(pca_mean_file)
-        n_components = pca_components.shape[0]
-        pca = PCA(n_components=n_components)
-        pca.components_ = pca_components
-        pca.mean_ = pca_mean
-        X_pca = pca.transform(X_scaled)
-    else:
-        # Perform PCA on all features
-        n_components = choose_n_components(X_scaled, variance_threshold=0.95)
-        pca = PCA(n_components=n_components)
-        X_pca = pca.fit_transform(X_scaled)
-        np.save(pca_file, pca.components_)
-        np.save(pca_mean_file, pca.mean_)
-        logging.info(f"PCA components and mean saved as '{pca_file}' and '{pca_mean_file}'")
-
-    final_features = [f"Component_{i + 1}" for i in range(n_components)]
-    logging.info(f"Final features used by the NN: {final_features}")
-
     # Scale the target
     scaler_y = StandardScaler()
-    y_scaled = scaler_y.fit_transform(y.reshape(-1, 1)).flatten()  # Ensure y_scaled is a 1D array
+    y_scaled = scaler_y.fit_transform(y.reshape(-1, 1)).flatten()
 
-    # Ensure the feature and target arrays have the same number of rows
-    if X_pca.shape[0] != y_scaled.shape[0]:
-        raise ValueError(f"Feature and target arrays have mismatched sizes: {X_pca.shape[0]} vs {y_scaled.shape[0]}")
+    # Perform PCA if necessary (you can adjust or remove this part if not needed)
+    pca = PCA(n_components=0.95)  # Keeping 95% of variance
+    X_pca = pca.fit_transform(X_scaled)
 
-    return np.hstack((X_pca, y_scaled.reshape(-1, 1))), pca
-
+    return np.hstack((X_pca, y_scaled.reshape(-1, 1))), scaler_y, pca
 
 def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, device, patience=5):
     model.to(device)
@@ -213,18 +200,41 @@ def evaluate_dollar_difference(model, data_loader, scaler_y, device):
     total_abs_error = 0
     count = 0
 
+    # Check the type of scaler_y
+    if not isinstance(scaler_y, StandardScaler):
+        raise TypeError(f"Expected StandardScaler, but got {type(scaler_y)}")
+
     with torch.no_grad():
         for X_batch, y_batch in data_loader:
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
             y_pred, _ = model(X_batch)
 
-            # Convert predictions and targets back to the original scale
-            y_pred_unscaled = scaler_y.inverse_transform(y_pred.cpu().numpy().reshape(-1, 1))
-            y_batch_unscaled = scaler_y.inverse_transform(y_batch.cpu().numpy().reshape(-1, 1))
+            # Log shapes for debugging
+            logging.debug(f"y_pred shape: {y_pred.shape}, y_batch shape: {y_batch.shape}")
 
-            # Calculate the absolute error
-            total_abs_error += np.sum(np.abs(y_pred_unscaled - y_batch_unscaled))
-            count += len(y_batch)
+            # Ensure y_pred and y_batch have the correct shape
+            y_pred = y_pred.view(-1, 1)
+            y_batch = y_batch.view(-1, 1)
+
+            # Convert to numpy and reshape if necessary
+            y_pred_np = y_pred.cpu().numpy()
+            y_batch_np = y_batch.cpu().numpy()
+
+            try:
+                # Convert predictions and targets back to the original scale
+                y_pred_unscaled = scaler_y.inverse_transform(y_pred_np)
+                y_batch_unscaled = scaler_y.inverse_transform(y_batch_np)
+
+                # Calculate the absolute error
+                total_abs_error += np.sum(np.abs(y_pred_unscaled - y_batch_unscaled))
+                count += len(y_batch)
+            except ValueError as e:
+                logging.error(f"Error in inverse transform: {str(e)}")
+                logging.error(f"y_pred_np shape: {y_pred_np.shape}, y_batch_np shape: {y_batch_np.shape}")
+                raise
+
+    if count == 0:
+        raise ValueError("No samples were processed")
 
     average_dollar_diff = total_abs_error / count
     return average_dollar_diff
@@ -246,6 +256,7 @@ def main(config_path):
         processed_data = {}
         data_loaders = {}
         scaler_y = None
+        pca = None
 
         for dataset_name, data_path in datasets.items():
             # Load data
@@ -274,17 +285,20 @@ def main(config_path):
                 logging.warning(f"Initial {dataset_name} data contains infinite values")
 
             # Preprocess data
-            processed_data[dataset_name], pca = preprocess_data(data, config)
+            if dataset_name == 'train':
+                # Extract the target scaler from the training data
+                processed_data[dataset_name], scaler_y, pca = preprocess_data(data, config)
+                if not isinstance(scaler_y, StandardScaler):
+                    raise TypeError(f"Expected StandardScaler for scaler_y, but got {type(scaler_y)}")
+            else:
+                processed_data[dataset_name], _, _ = preprocess_data(data, config)
+
             logging.info(
                 f"{dataset_name.capitalize()} data preprocessed successfully. Shape: {processed_data[dataset_name].shape}")
 
-            # Create datasets and dataloaders
             dataset = CryptoDataset(processed_data[dataset_name], seq_length=config['seq_length'])
-            data_loaders[dataset_name] = DataLoader(dataset, batch_size=config['batch_size'], shuffle=True)
-
-            if dataset_name == 'train':
-                # Extract the target scaler from the training data
-                _, scaler_y = preprocess_data(data, config)
+            data_loaders[dataset_name] = DataLoader(dataset, batch_size=config['batch_size'],
+                                                    shuffle=(dataset_name == 'train'))
 
         # Initialize the model
         input_dim = processed_data['train'].shape[1] - 1
@@ -298,27 +312,33 @@ def main(config_path):
 
         # Train the model
         train_model(model, data_loaders['train'], data_loaders['val'], criterion, optimizer, scheduler,
-                    config['num_epochs'], torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+                    config['num_epochs'], device)
 
         # Evaluate the model on the test set
         model.load_state_dict(torch.load(os.path.join(subfolder, 'best_lstm_model.pth')))
         model.eval()
         test_loss = 0
+        test_actuals = []
+        test_predictions = []
         with torch.no_grad():
             for X_batch, y_batch in data_loaders['test']:
-                X_batch, y_batch = X_batch.to(torch.device('cuda' if torch.cuda.is_available() else 'cpu')), y_batch.to(
-                    torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+                X_batch, y_batch = X_batch.to(device), y_batch.to(
+                    device)
                 y_pred, _ = model(X_batch)
                 loss = criterion(y_pred.squeeze(), y_batch)
                 test_loss += loss.item()
+                test_actuals.extend(y_batch.cpu().numpy())
+                test_predictions.extend(y_pred.squeeze().cpu().numpy())
         test_loss /= len(data_loaders['test'])
         logging.info(f'Test Loss: {test_loss:.4f}')
         print(f"y_pred shape: {y_pred.shape}")
         print(f"scaler_y mean shape: {scaler_y.mean_.shape}")  # This assumes `scaler_y` is a StandardScaler
 
+        np.save(os.path.join(subfolder, 'test_actuals.npy'), np.array(test_actuals))
+        np.save(os.path.join(subfolder, 'test_predictions.npy'), np.array(test_predictions))
+
         average_dollar_difference = evaluate_dollar_difference(model, data_loaders['test'], scaler_y,
-                                                               torch.device(
-                                                                   'cuda' if torch.cuda.is_available() else 'cpu'))
+                                                               device)
         logging.info(f'Average Dollar Difference: ${average_dollar_difference:.2f}')
 
     except Exception as e:

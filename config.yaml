@@ -2,7 +2,7 @@
 train_data_path: 'data/BTCUSDT-1s-2023-11.csv'
 val_data_path: 'data/BTCUSDT-1s-2023-12.csv'
 test_data_path: 'data/BTCUSDT-1s-2024-01.csv'
-data_limit: 1000
+data_limit: 10000
 target: 'Close'
 seq_length: 60
 batch_size: 32
