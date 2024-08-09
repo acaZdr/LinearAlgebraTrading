@@ -16,6 +16,9 @@ def display_npy_file(file_path):
     csv_file_path = file_path.replace('.npy', '.csv')
     df.to_csv(csv_file_path, index=False)
     print(f"Data saved to {csv_file_path}")
+    # print mean and std
+    print(f"Mean: {np.mean(data)}")
+    print(f"Std: {np.std(data)}")
 
 
 display_npy_file('results/test_actuals.npy')

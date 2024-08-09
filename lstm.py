@@ -1,10 +1,8 @@
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 from ta import add_all_ta_features
-from ta.momentum import RSIIndicator
-from ta.trend import MACD, EMAIndicator
-from ta.volatility import BollingerBands
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
@@ -21,27 +19,6 @@ subfolder = 'results'
 if not os.path.exists(subfolder):
     os.makedirs(subfolder)
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
-
-
-def add_lookback_ta_features(df):
-    # Add Bollinger Bands
-    indicator_bb = BollingerBands(close=df["Close"], window=20, window_dev=2)
-    df['bb_high'] = indicator_bb.bollinger_hband()
-    df['bb_low'] = indicator_bb.bollinger_lband()
-
-    # Add MACD
-    indicator_macd = MACD(close=df["Close"])
-    df['macd'] = indicator_macd.macd()
-    df['macd_signal'] = indicator_macd.macd_signal()
-
-    # Add EMA
-    df['ema_12'] = EMAIndicator(close=df["Close"], window=12).ema_indicator()
-    df['ema_26'] = EMAIndicator(close=df["Close"], window=26).ema_indicator()
-
-    # Add RSI
-    df['rsi'] = RSIIndicator(close=df["Close"]).rsi()
-
-    return df
 
 
 class Attention(nn.Module):
@@ -73,8 +50,6 @@ class LSTMModel(nn.Module):
         context_vector, attention_weights = self.attention(lstm_out)
         out = self.fc(context_vector)
         return out.view(-1, 1), attention_weights
-
-    # Custom dataset
 
 
 class CryptoDataset(Dataset):
@@ -115,19 +90,23 @@ def choose_n_components(X_scaled, variance_threshold=0.95):
     return n_components
 
 
-def preprocess_data(data, config):
+def preprocess_data(data, config, scaler_X=None, scaler_y=None, pca=None):
     # Shift the target variable
     target = config['target']
-    data['target'] = data[target].shift(-1)  # Shift the target to predict next second's close
+    data['target'] = data[target].shift(-1)  # Shift the target to predict next minute's close
 
     # Calculate lookback technical indicators
-    data = add_lookback_ta_features(data)
+    data = add_all_ta_features(data, "Open", "High", "Low", "Close", "Volume", fillna=True)
 
     # Drop the last row as it won't have a target value
     data = data.dropna().reset_index(drop=True)
 
+    look_ahead_indicators = ['trend_ichimoku_a', 'trend_ichimoku_b', 'trend_visual_ichimoku_a',
+                             'trend_visual_ichimoku_b', 'trend_stc', 'trend_psar_up', 'trend_psar_down']
+
     # Drop OHLCV columns from the dataset, keeping only the indicators and target
-    feature_columns = ['bb_high', 'bb_low', 'macd', 'macd_signal', 'ema_12', 'ema_26', 'rsi']
+    feature_columns = [col for col in data.columns if col not in
+                       (['date', 'Open', 'High', 'Low', 'Volume', 'target'] + look_ahead_indicators)]
 
     # Ensure all feature columns exist in the dataframe
     feature_columns = [col for col in feature_columns if col in data.columns]
@@ -135,21 +114,39 @@ def preprocess_data(data, config):
     X = data[feature_columns].values
     y = data['target'].values
 
-    # Standardize the features
+
+    # if scaler_X is None:
+    #     # Standardize the features
+    #     scaler_X = StandardScaler()
+    #     X_scaled = scaler_X.fit_transform(X)
+    #     # print scaled X into a csv
+    #     pd.DataFrame(X_scaled).to_csv('X_scaled.csv', index=False)
+    # else:
+    #     X_scaled = scaler_X.transform(X)
+    #     pd.DataFrame(X_scaled).to_csv('X_scaled_test.csv', index=False)
+    #
+    # if scaler_y is None:
+    #     # Scale the target
+    #     scaler_y = StandardScaler()
+    #     y_scaled = scaler_y.fit_transform(y.reshape(-1, 1)).flatten()
+    # else:
+    #     y_scaled = scaler_y.transform(y.reshape(-1, 1)).flatten()
+    #
     scaler_X = StandardScaler()
     X_scaled = scaler_X.fit_transform(X)
-
-    # Scale the target
     scaler_y = StandardScaler()
     y_scaled = scaler_y.fit_transform(y.reshape(-1, 1)).flatten()
+    if pca is None:
+        # Perform PCA if necessary (you can adjust or remove this part if not needed)
+        pca = PCA(n_components=0.95)  # Keeping 95% of variance
+        X_pca = pca.fit_transform(X_scaled)
+    else:
+        X_pca = pca.transform(X_scaled)
 
-    # Perform PCA if necessary (you can adjust or remove this part if not needed)
-    pca = PCA(n_components=0.95)  # Keeping 95% of variance
-    X_pca = pca.fit_transform(X_scaled)
+    return np.hstack((X_pca, y_scaled.reshape(-1, 1))), scaler_X, scaler_y, pca
 
-    return np.hstack((X_pca, y_scaled.reshape(-1, 1))), scaler_y, pca
 
-def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, device, patience=5):
+def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, patience=5):
     model.to(device)
     best_val_loss = float('inf')
     patience_counter = 0
@@ -240,6 +237,30 @@ def evaluate_dollar_difference(model, data_loader, scaler_y, device):
     return average_dollar_diff
 
 
+def display_npy_file(file_path):
+    """Load a .npy file and save it as a CSV file."""
+    data = np.load(file_path)
+    df = pd.DataFrame(data)
+    csv_file_path = file_path.replace('.npy', '.csv')
+    df.to_csv(csv_file_path, index=False)
+    print(f"Data saved to {csv_file_path}")
+
+
+def save_and_display_results(test_actuals, test_predictions, subfolder):
+    """Save the actual and predicted values, and convert them to CSV files."""
+    actuals_path = os.path.join(subfolder, 'test_actuals.npy')
+    predictions_path = os.path.join(subfolder, 'test_predictions.npy')
+
+    # Save as .npy files
+    np.save(actuals_path, np.array(test_actuals))
+    np.save(predictions_path, np.array(test_predictions))
+
+    # Convert .npy to .csv
+    display_npy_file(actuals_path)
+    display_npy_file(predictions_path)
+
+
+
 def main(config_path):
     # Load configuration
     config = load_config(config_path)
@@ -255,55 +276,21 @@ def main(config_path):
 
         processed_data = {}
         data_loaders = {}
+        scaler_X = None
         scaler_y = None
         pca = None
 
         for dataset_name, data_path in datasets.items():
-            # Load data
+            # Load and preprocess data
             data = import_data(data_path, limit=config.get('data_limit'))
-            logging.info(f"{dataset_name.capitalize()} data loaded successfully. Shape: {data.shape}")
-
-            # Log data info
-            logging.info(f"Columns in the {dataset_name} dataset: {data.columns.tolist()}")
-            logging.info(f"Data types: \n{data.dtypes}")
-
-            # Check for non-numeric columns
-            non_numeric_columns = data.select_dtypes(exclude=[np.number]).columns
-            if len(non_numeric_columns) > 0:
-                data = data.drop(columns=non_numeric_columns)
-
-            logging.info(f"First few rows of the {dataset_name} data: \n{data.head()}")
-            logging.info(f"{dataset_name.capitalize()} data description: \n{data.describe()}")
-
-            # Check for any initial NaN or infinite values
-            if data.isna().any().any():
-                logging.warning(f"Initial {dataset_name} data contains NaN values")
-
-            # Convert data to float for isinf check
-            numeric_data = data.astype(np.float64)
-            if np.isinf(numeric_data.values).any():
-                logging.warning(f"Initial {dataset_name} data contains infinite values")
-
-            # Preprocess data
-            if dataset_name == 'train':
-                # Extract the target scaler from the training data
-                processed_data[dataset_name], scaler_y, pca = preprocess_data(data, config)
-                if not isinstance(scaler_y, StandardScaler):
-                    raise TypeError(f"Expected StandardScaler for scaler_y, but got {type(scaler_y)}")
-            else:
-                processed_data[dataset_name], _, _ = preprocess_data(data, config)
-
-            logging.info(
-                f"{dataset_name.capitalize()} data preprocessed successfully. Shape: {processed_data[dataset_name].shape}")
-
+            processed_data[dataset_name], scaler_X, scaler_y, pca = preprocess_data(data, config, scaler_X, scaler_y, pca)
             dataset = CryptoDataset(processed_data[dataset_name], seq_length=config['seq_length'])
-            data_loaders[dataset_name] = DataLoader(dataset, batch_size=config['batch_size'],
-                                                    shuffle=(dataset_name == 'train'))
+            data_loaders[dataset_name] = DataLoader(dataset, batch_size=config['batch_size'], shuffle=False)
 
         # Initialize the model
         input_dim = processed_data['train'].shape[1] - 1
-        model = LSTMModel(input_dim=input_dim, hidden_dim=config['hidden_dim'],
-                          num_layers=config['num_layers'], output_dim=1, dropout=config['dropout'])
+        print(input_dim)
+        model = LSTMModel(input_dim=input_dim, hidden_dim=config['hidden_dim'], num_layers=config['num_layers'], output_dim=1, dropout=config['dropout'])
 
         # Define the loss function and optimizer
         criterion = nn.MSELoss()
@@ -311,8 +298,7 @@ def main(config_path):
         scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
 
         # Train the model
-        train_model(model, data_loaders['train'], data_loaders['val'], criterion, optimizer, scheduler,
-                    config['num_epochs'], device)
+        train_model(model, data_loaders['train'], data_loaders['val'], criterion, optimizer, scheduler, config['num_epochs'])
 
         # Evaluate the model on the test set
         model.load_state_dict(torch.load(os.path.join(subfolder, 'best_lstm_model.pth')))
@@ -322,8 +308,7 @@ def main(config_path):
         test_predictions = []
         with torch.no_grad():
             for X_batch, y_batch in data_loaders['test']:
-                X_batch, y_batch = X_batch.to(device), y_batch.to(
-                    device)
+                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
                 y_pred, _ = model(X_batch)
                 loss = criterion(y_pred.squeeze(), y_batch)
                 test_loss += loss.item()
@@ -331,14 +316,12 @@ def main(config_path):
                 test_predictions.extend(y_pred.squeeze().cpu().numpy())
         test_loss /= len(data_loaders['test'])
         logging.info(f'Test Loss: {test_loss:.4f}')
-        print(f"y_pred shape: {y_pred.shape}")
-        print(f"scaler_y mean shape: {scaler_y.mean_.shape}")  # This assumes `scaler_y` is a StandardScaler
 
-        np.save(os.path.join(subfolder, 'test_actuals.npy'), np.array(test_actuals))
-        np.save(os.path.join(subfolder, 'test_predictions.npy'), np.array(test_predictions))
+        # Save and display results
+        save_and_display_results(test_actuals, test_predictions, subfolder)
 
-        average_dollar_difference = evaluate_dollar_difference(model, data_loaders['test'], scaler_y,
-                                                               device)
+        # Calculate and log average dollar difference
+        average_dollar_difference = evaluate_dollar_difference(model, data_loaders['test'], scaler_y, device)
         logging.info(f'Average Dollar Difference: ${average_dollar_difference:.2f}')
 
     except Exception as e:
