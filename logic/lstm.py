@@ -15,7 +15,7 @@ from data_preprocessing import import_data
 import torch.optim.lr_scheduler as lr_scheduler
 
 # Set up the results subfolder
-subfolder = 'results'
+subfolder = '../results'
 if not os.path.exists(subfolder):
     os.makedirs(subfolder)
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
@@ -187,9 +187,9 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         else:
             patience_counter += 1
 
-        if patience_counter >= patience:
-            print("Early stopping triggered")
-            break
+        # if patience_counter >= patience:
+        #     print("Early stopping triggered")
+        #     break
 
 
 def evaluate_dollar_difference(model, data_loader, scaler_y, device):
@@ -282,7 +282,7 @@ def main(config_path):
 
         for dataset_name, data_path in datasets.items():
             # Load and preprocess data
-            data = import_data(data_path, limit=config.get('data_limit'))
+            data = import_data(data_path)
             processed_data[dataset_name], scaler_X, scaler_y, pca = preprocess_data(data, config, scaler_X, scaler_y, pca)
             dataset = CryptoDataset(processed_data[dataset_name], seq_length=config['seq_length'])
             data_loaders[dataset_name] = DataLoader(dataset, batch_size=config['batch_size'], shuffle=False)
