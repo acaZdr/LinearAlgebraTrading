@@ -15,7 +15,7 @@ from data_preprocessing import import_data
 import torch.optim.lr_scheduler as lr_scheduler
 
 # Set up the results subfolder
-subfolder = '../results'
+subfolder = 'results'
 if not os.path.exists(subfolder):
     os.makedirs(subfolder)
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
@@ -90,7 +90,7 @@ def choose_n_components(X_scaled, variance_threshold=0.95):
     return n_components
 
 
-def preprocess_data(data, config, scaler_X=None, scaler_y=None, pca=None):
+def preprocess_data(data, config, scaler_X=None, scaler_y=None, pca=None, fit=False):
     # Shift the target variable
     target = config['target']
     data['target'] = data[target].shift(-1)  # Shift the target to predict next minute's close
@@ -114,39 +114,24 @@ def preprocess_data(data, config, scaler_X=None, scaler_y=None, pca=None):
     X = data[feature_columns].values
     y = data['target'].values
 
+    if not fit:
+        scaler_X = StandardScaler()
+        X_scaled = scaler_X.fit_transform(X)
 
-    # if scaler_X is None:
-    #     # Standardize the features
-    #     scaler_X = StandardScaler()
-    #     X_scaled = scaler_X.fit_transform(X)
-    #     # print scaled X into a csv
-    #     pd.DataFrame(X_scaled).to_csv('X_scaled.csv', index=False)
-    # else:
-    #     X_scaled = scaler_X.transform(X)
-    #     pd.DataFrame(X_scaled).to_csv('X_scaled_test.csv', index=False)
-    #
-    # if scaler_y is None:
-    #     # Scale the target
-    #     scaler_y = StandardScaler()
-    #     y_scaled = scaler_y.fit_transform(y.reshape(-1, 1)).flatten()
-    # else:
-    #     y_scaled = scaler_y.transform(y.reshape(-1, 1)).flatten()
-    #
-    scaler_X = StandardScaler()
-    X_scaled = scaler_X.fit_transform(X)
-    scaler_y = StandardScaler()
-    y_scaled = scaler_y.fit_transform(y.reshape(-1, 1)).flatten()
-    if pca is None:
-        # Perform PCA if necessary (you can adjust or remove this part if not needed)
-        pca = PCA(n_components=0.95)  # Keeping 95% of variance
-        X_pca = pca.fit_transform(X_scaled)
+        scaler_y = StandardScaler()
+        y_scaled = scaler_y.fit_transform(y.reshape(-1, 1)).flatten()
+
+        # pca = PCA(n_components=0.95)
+        # X_pca = pca.fit_transform(X_scaled)
     else:
-        X_pca = pca.transform(X_scaled)
+        X_scaled = scaler_X.transform(X)
+        y_scaled = scaler_y.transform(y.reshape(-1, 1)).flatten()
+        # X_pca = pca.transform(X_scaled)
 
-    return np.hstack((X_pca, y_scaled.reshape(-1, 1))), scaler_X, scaler_y, pca
+    return np.hstack((X_scaled, y_scaled.reshape(-1, 1))), scaler_X, scaler_y, pca
 
 
-def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, patience=5):
+def train_model(model: nn.Module, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, patience=5):
     model.to(device)
     best_val_loss = float('inf')
     patience_counter = 0
@@ -260,7 +245,6 @@ def save_and_display_results(test_actuals, test_predictions, subfolder):
     display_npy_file(predictions_path)
 
 
-
 def main(config_path):
     # Load configuration
     config = load_config(config_path)
@@ -279,18 +263,22 @@ def main(config_path):
         scaler_X = None
         scaler_y = None
         pca = None
+        fit = False
 
         for dataset_name, data_path in datasets.items():
             # Load and preprocess data
             data = import_data(data_path)
-            processed_data[dataset_name], scaler_X, scaler_y, pca = preprocess_data(data, config, scaler_X, scaler_y, pca)
+            processed_data[dataset_name], scaler_X, scaler_y, pca = preprocess_data(data, config, scaler_X, scaler_y,
+                                                                                    pca, fit)
+            fit = True
             dataset = CryptoDataset(processed_data[dataset_name], seq_length=config['seq_length'])
             data_loaders[dataset_name] = DataLoader(dataset, batch_size=config['batch_size'], shuffle=False)
 
         # Initialize the model
         input_dim = processed_data['train'].shape[1] - 1
         print(input_dim)
-        model = LSTMModel(input_dim=input_dim, hidden_dim=config['hidden_dim'], num_layers=config['num_layers'], output_dim=1, dropout=config['dropout'])
+        model = LSTMModel(input_dim=input_dim, hidden_dim=config['hidden_dim'], num_layers=config['num_layers'],
+                          output_dim=1, dropout=config['dropout'])
 
         # Define the loss function and optimizer
         criterion = nn.MSELoss()
@@ -298,7 +286,8 @@ def main(config_path):
         scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
 
         # Train the model
-        train_model(model, data_loaders['train'], data_loaders['val'], criterion, optimizer, scheduler, config['num_epochs'])
+        train_model(model, data_loaders['train'], data_loaders['val'], criterion, optimizer, scheduler,
+                    config['num_epochs'])
 
         # Evaluate the model on the test set
         model.load_state_dict(torch.load(os.path.join(subfolder, 'best_lstm_model.pth')))
