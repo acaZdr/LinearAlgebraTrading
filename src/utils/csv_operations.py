@@ -1,5 +1,5 @@
-import pandas as pd
 import csv
+import pandas as pd
 
 
 def combine_csv_files(file_paths, limit=None) -> pd.DataFrame:
@@ -25,28 +25,13 @@ def combine_csv_files(file_paths, limit=None) -> pd.DataFrame:
             continue
 
     if not data_frames:
-        raise ValueError("No files were successfully loaded.")
+        raise ValueError("No figures were successfully loaded.")
 
     # Check that all dataframes have the same number of columns
     num_columns = data_frames[0].shape[1]
     for df in data_frames[1:]:
         if df.shape[1] != num_columns:
-            raise ValueError("Not all CSV files have the same number of columns.")
+            raise ValueError("Not all CSV figures have the same number of columns.")
 
     combined_data = pd.concat(data_frames, ignore_index=True)
     return combined_data
-
-
-def import_data(file_paths, limit=None):
-    if isinstance(file_paths, str):
-        file_paths = [file_paths]
-
-    combined_data = combine_csv_files(file_paths, limit)
-
-    df = combined_data.iloc[:, :6]  # Select only the first 6 columns
-    df.columns = ['date', 'Open', 'High', 'Low', 'Close', 'Volume']
-
-    df['date'] = pd.to_datetime(df['date'], unit='ms')
-
-    return df
-

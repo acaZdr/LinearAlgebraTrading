@@ -4,19 +4,13 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.decomposition import PCA
-import yaml
 import argparse
 import logging
 import traceback
-from data_preprocessing import import_data
+from src.data_preprocessing.data_importer import import_data
 from ta import add_all_ta_features
 import matplotlib.pyplot as plt
 
-
-def load_config(config_path):
-    """Load configuration from a YAML file."""
-    with open(config_path, 'r') as file:
-        return yaml.safe_load(file)
 
 
 def choose_n_components(X_scaled, variance_threshold=0.95):

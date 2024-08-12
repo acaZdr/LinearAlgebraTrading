@@ -1,5 +1,4 @@
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
 from ta import add_all_ta_features
@@ -7,17 +6,20 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
-import yaml
 import os
 import logging
 import traceback
-from data_preprocessing import import_data
 import torch.optim.lr_scheduler as lr_scheduler
+from src.data_preprocessing.data_importer import import_data
+from src.utils.config_loader import load_config
+from src.utils.data_saving_and_displaying import save_and_display_results
 
-# Set up the results subfolder
-subfolder = 'results'
+
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+subfolder = os.path.join(project_root, 'results', 'outputs')
 if not os.path.exists(subfolder):
     os.makedirs(subfolder)
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
 
 
@@ -63,12 +65,6 @@ class CryptoDataset(Dataset):
     def __getitem__(self, idx):
         return (self.data[idx:idx + self.seq_length, :-1],
                 self.data[idx + self.seq_length - 1, -1])
-
-
-def load_config(config_path):
-    """Load configuration from a YAML file."""
-    with open(config_path, 'r') as file:
-        return yaml.safe_load(file)
 
 
 def choose_n_components(X_scaled, variance_threshold=0.95):
@@ -222,29 +218,6 @@ def evaluate_dollar_difference(model, data_loader, scaler_y, device):
     return average_dollar_diff
 
 
-def display_npy_file(file_path):
-    """Load a .npy file and save it as a CSV file."""
-    data = np.load(file_path)
-    df = pd.DataFrame(data)
-    csv_file_path = file_path.replace('.npy', '.csv')
-    df.to_csv(csv_file_path, index=False)
-    print(f"Data saved to {csv_file_path}")
-
-
-def save_and_display_results(test_actuals, test_predictions, subfolder):
-    """Save the actual and predicted values, and convert them to CSV files."""
-    actuals_path = os.path.join(subfolder, 'test_actuals.npy')
-    predictions_path = os.path.join(subfolder, 'test_predictions.npy')
-
-    # Save as .npy files
-    np.save(actuals_path, np.array(test_actuals))
-    np.save(predictions_path, np.array(test_predictions))
-
-    # Convert .npy to .csv
-    display_npy_file(actuals_path)
-    display_npy_file(predictions_path)
-
-
 def main(config_path):
     # Load configuration
     config = load_config(config_path)
@@ -253,10 +226,15 @@ def main(config_path):
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
     try:
+        logging.info("Starting main function")
+        logging.info(f"Configuration loaded from: {config_path}")
+
         # Process training, validation, and test data
-        datasets = {'train': config['train_data_path'],
-                    'val': config['val_data_path'],
-                    'test': config['test_data_path']}
+        datasets = {
+            'train': os.path.join(project_root, 'data', config['train_data_path']),
+            'val': os.path.join(project_root, 'data', config['val_data_path']),
+            'test': os.path.join(project_root, 'data', config['test_data_path'])
+        }
 
         processed_data = {}
         data_loaders = {}
@@ -266,30 +244,41 @@ def main(config_path):
         fit = False
 
         for dataset_name, data_path in datasets.items():
+            logging.info(f"Processing {dataset_name} dataset from {data_path}")
             # Load and preprocess data
-            data = import_data(data_path)
+            data = import_data(data_path, limit=config['data_limit'])
+            logging.info(f"Data imported for {dataset_name}, shape: {data.shape}")
+
             processed_data[dataset_name], scaler_X, scaler_y, pca = preprocess_data(data, config, scaler_X, scaler_y,
                                                                                     pca, fit)
+            logging.info(f"Data preprocessed for {dataset_name}, shape: {processed_data[dataset_name].shape}")
+
             fit = True
             dataset = CryptoDataset(processed_data[dataset_name], seq_length=config['seq_length'])
             data_loaders[dataset_name] = DataLoader(dataset, batch_size=config['batch_size'], shuffle=False)
+            logging.info(f"DataLoader created for {dataset_name}")
 
         # Initialize the model
         input_dim = processed_data['train'].shape[1] - 1
-        print(input_dim)
+        logging.info(f"Input dimension: {input_dim}")
         model = LSTMModel(input_dim=input_dim, hidden_dim=config['hidden_dim'], num_layers=config['num_layers'],
                           output_dim=1, dropout=config['dropout'])
+        logging.info(f"Model initialized with hidden_dim: {config['hidden_dim']}, num_layers: {config['num_layers']}")
 
         # Define the loss function and optimizer
         criterion = nn.MSELoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'])
         scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
+        logging.info(f"Loss function, optimizer, and scheduler initialized. Learning rate: {config['learning_rate']}")
 
         # Train the model
+        logging.info("Starting model training")
         train_model(model, data_loaders['train'], data_loaders['val'], criterion, optimizer, scheduler,
                     config['num_epochs'])
+        logging.info("Model training completed")
 
         # Evaluate the model on the test set
+        logging.info("Starting model evaluation on test set")
         model.load_state_dict(torch.load(os.path.join(subfolder, 'best_lstm_model.pth')))
         model.eval()
         test_loss = 0
@@ -307,9 +296,12 @@ def main(config_path):
         logging.info(f'Test Loss: {test_loss:.4f}')
 
         # Save and display results
+        logging.info("Saving and displaying results")
         save_and_display_results(test_actuals, test_predictions, subfolder)
+        logging.info(f"Results saved in {subfolder}")
 
         # Calculate and log average dollar difference
+        logging.info("Calculating average dollar difference")
         average_dollar_difference = evaluate_dollar_difference(model, data_loaders['test'], scaler_y, device)
         logging.info(f'Average Dollar Difference: ${average_dollar_difference:.2f}')
 
@@ -317,7 +309,9 @@ def main(config_path):
         logging.error(f"An error occurred: {str(e)}")
         traceback.print_exc()
 
+    logging.info("Main completed")
+
 
 if __name__ == "__main__":
-    config_path = 'config.yaml'
+    config_path = '../../config/config.yaml'
     main(config_path)

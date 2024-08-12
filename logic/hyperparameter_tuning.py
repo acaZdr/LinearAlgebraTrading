@@ -20,7 +20,7 @@ param_combinations = list(itertools.product(*param_grids.values()))
 lstm_script = 'lstm.py'
 
 # Path to the base config file
-base_config_path = 'config.yaml'
+base_config_path = '../config/config.yaml'
 
 # Results storage
 results = []
@@ -53,10 +53,12 @@ def run_experiment(params):
         output = result.stdout + result.stderr  # Combine stdout and stderr
 
         test_loss_match = re.search(r'Test Loss:\s*([\d.]+)', output)
-
+        avg_usd_match = re.search(r'Average Dollar Difference:\s*\$([\d.]+)', output)
         if test_loss_match:
             test_loss = float(test_loss_match.group(1))
             print(f"Test Loss: {test_loss}")
+            avg_usd = avg_usd_match.group(1)
+            print(f"Average Dollar Difference: {avg_usd}")
             return test_loss
         else:
             print("Test Loss not found in the output.")

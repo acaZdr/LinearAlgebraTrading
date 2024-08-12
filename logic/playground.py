@@ -5,12 +5,11 @@ from ta import add_all_ta_features
 from ta.utils import dropna
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
-from sklearn.feature_selection import SelectKBest, f_regression
 import argparse
 import yaml
 import logging
 
-from data_preprocessing import import_data
+from src.data_preprocessing import import_data
 
 
 def load_config(config_path):
