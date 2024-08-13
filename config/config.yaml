@@ -1,10 +1,14 @@
 # config.yaml
 train_data:
-  - 'BTCUSDT-1s-2023-11.csv'
-val_data: 'BTCUSDT-1s-2023-12.csv'
-test_data: 'BTCUSDT-1s-2024-01.csv'
+  - 'BTCUSDT-3m-2023-07.csv'
+  - 'BTCUSDT-3m-2023-08.csv'
+  - 'BTCUSDT-3m-2023-09.csv'
+  - 'BTCUSDT-3m-2023-10.csv'
+  - 'BTCUSDT-3m-2023-11.csv'
+val_data: 'BTCUSDT-3m-2023-12.csv'
+test_data: 'BTCUSDT-3m-2024-01.csv'
 download_dir: 'data'
-data_limit: 10000
+data_limit: 100000
 target: 'Close'
 seq_length: 60
 batch_size: 4
