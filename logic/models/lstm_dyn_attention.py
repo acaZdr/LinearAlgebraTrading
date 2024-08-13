@@ -24,28 +24,30 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.ba
 
 
 class DynamicAttention(nn.Module):
-    def __init__(self, hidden_dim, volatility_dim):
+    def __init__(self, hidden_dim):
         super(DynamicAttention, self).__init__()
-        self.volatility_layer = nn.Linear(volatility_dim, hidden_dim, bias=False)
+        self.volatility_layer = nn.Linear(1, hidden_dim, bias=False)
         self.attention = nn.Linear(hidden_dim, 1, bias=False)
 
     def forward(self, lstm_out, volatility):
+        # Reshape volatility to (batch_size, seq_length, 1)
+        volatility = volatility.unsqueeze(-1)
+
         # Calculate dynamic attention weights based on volatility
         dynamic_weights = torch.tanh(self.volatility_layer(volatility))
-        attention_weights = torch.softmax(self.attention(lstm_out * dynamic_weights.unsqueeze(1)).squeeze(-1), dim=1)
+        attention_weights = torch.softmax(self.attention(lstm_out * dynamic_weights).squeeze(-1), dim=1)
         context_vector = torch.sum(attention_weights.unsqueeze(-1) * lstm_out, dim=1)
         return context_vector, attention_weights
 
 
-# Define the LSTM model with Dynamic Attention
 class LSTMModel(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_layers, output_dim, volatility_dim, dropout=0.5):
+    def __init__(self, input_dim, hidden_dim, num_layers, output_dim, dropout=0.5):
         super(LSTMModel, self).__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
 
         self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout)
-        self.attention = DynamicAttention(hidden_dim, volatility_dim)
+        self.attention = DynamicAttention(hidden_dim)
         self.fc = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, x, volatility):
@@ -70,7 +72,6 @@ class CryptoDataset(Dataset):
         return (self.data[idx:idx + self.seq_length, :-1],
                 self.volatility[idx:idx + self.seq_length],
                 self.data[idx + self.seq_length - 1, -1])
-
 
 def choose_n_components(X_scaled, variance_threshold=0.95):
     pca = PCA().fit(X_scaled)
@@ -124,7 +125,6 @@ def preprocess_data(data, config, scaler_X=None, scaler_y=None, scaler_volatilit
         volatility_scaled = scaler_volatility.transform(volatility.values.reshape(-1, 1)).flatten()
 
     return np.hstack((X_scaled, y_scaled.reshape(-1, 1))), volatility_scaled, scaler_X, scaler_y, scaler_volatility, pca
-
 
 def train_model(model: nn.Module, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, patience=5):
     model.to(device)
@@ -239,12 +239,12 @@ def main(config_path):
         # Process each dataset (train, val, test)
         for dataset_name, data_path in datasets.items():
             logging.info(f"Processing {dataset_name} dataset from {data_path}")
-            # Load and preprocess data
             data = import_data(data_path, limit=config.get('data_limit', None))
             logging.info(f"Data imported for {dataset_name}, shape: {data.shape}")
 
             if dataset_name == 'train':
-                processed_data[dataset_name], preprocessed_volatility, scaler_X, scaler_y, scaler_volatility, pca = preprocess_data(
+                processed_data[
+                    dataset_name], preprocessed_volatility, scaler_X, scaler_y, scaler_volatility, pca = preprocess_data(
                     data, config, fit=False)
                 fit = True
             else:
@@ -253,18 +253,18 @@ def main(config_path):
 
             logging.info(f"Data preprocessed for {dataset_name}, shape: {processed_data[dataset_name].shape}")
 
-            dataset = CryptoDataset(processed_data[dataset_name], preprocessed_volatility, seq_length=config['seq_length'])
-            data_loaders[dataset_name] = DataLoader(dataset, batch_size=config['batch_size'], shuffle=(dataset_name == 'train'))
+            dataset = CryptoDataset(processed_data[dataset_name], preprocessed_volatility,
+                                    seq_length=config['seq_length'])
+            data_loaders[dataset_name] = DataLoader(dataset, batch_size=config['batch_size'],
+                                                    shuffle=(dataset_name == 'train'))
             logging.info(f"DataLoader created for {dataset_name}")
-
-        # Initialize the model
         input_dim = processed_data['train'].shape[1] - 1  # Exclude target column
         hidden_dim = config['hidden_dim']
         num_layers = config['num_layers']
         dropout = config['dropout']
-        model = LSTMModel(input_dim=input_dim, hidden_dim=hidden_dim, num_layers=num_layers, output_dim=1, volatility_dim=1, dropout=dropout)
+        model = LSTMModel(input_dim=input_dim, hidden_dim=hidden_dim, num_layers=num_layers, output_dim=1,
+                          dropout=dropout)
         logging.info(f"Model initialized with hidden_dim: {hidden_dim}, num_layers: {num_layers}, dropout: {dropout}")
-
         # Define the loss function and optimizer
         criterion = nn.MSELoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'])
