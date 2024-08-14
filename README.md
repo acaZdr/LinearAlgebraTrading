@@ -38,9 +38,10 @@ This will download the data and save it as CSV files in a specified directory.
 
 Edit the `config/config.yaml` file to specify the paths to your CSV datasets. The current configuration is set to:
 
-- `BTCUSDT-1s-2023-11.csv`
-- `BTCUSDT-1s-2023-12.csv`
-- `BTCUSDT-1s-2024-01.csv`
+- `BTCUSDT-3m-2023-11.csv`
+- `BTCUSDT-3m-2023-12.csv`
+- `BTCUSDT-3m-2024-01.csv`
+- ...
 
 Update these paths if necessary.
 

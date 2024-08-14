@@ -158,7 +158,7 @@ def train_model(model: nn.Module, train_loader, val_loader, criterion, optimizer
         train_loss /= len(train_loader)
         val_loss /= len(val_loader)
 
-        print(f'Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+        print(f'Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}')
 
         scheduler.step(val_loss)
 
@@ -172,6 +172,7 @@ def train_model(model: nn.Module, train_loader, val_loader, criterion, optimizer
         if patience_counter >= patience:
             print("Early stopping triggered")
             break
+
 
 def evaluate_dollar_difference(model, data_loader, scaler_y, device):
     model.eval()
@@ -226,8 +227,8 @@ def main(config_path):
         # Define paths for datasets
         datasets = {
             'train': [os.path.join(project_root, 'data', path) for path in config['train_data']],
-            'val': os.path.join(project_root, 'data', config['val_data']),
-            'test': os.path.join(project_root, 'data', config['test_data'])
+            'val': [os.path.join(project_root, 'data', path) for path in config['val_data']],
+            'test': [os.path.join(project_root, 'data', path) for path in config['test_data']]
         }
 
         processed_data = {}
@@ -293,7 +294,7 @@ def main(config_path):
                 test_actuals.extend(y_batch.cpu().numpy())
                 test_predictions.extend(y_pred.squeeze().cpu().numpy())
         test_loss /= len(data_loaders['test'])
-        logging.info(f'Test Loss: {test_loss:.4f}')
+        logging.info(f'Test Loss: {test_loss:.6f}')
 
         # Save and display results
         logging.info("Saving and displaying results")
