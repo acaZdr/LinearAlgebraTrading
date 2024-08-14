@@ -36,12 +36,8 @@ This will download the data and save it as CSV files in a specified directory.
 
 ### 2. Configure the Project
 
-Edit the `config/config.yaml` file to specify the paths to your CSV datasets. The current configuration is set to:
-
-- `BTCUSDT-3m-2023-11.csv`
-- `BTCUSDT-3m-2023-12.csv`
-- `BTCUSDT-3m-2024-01.csv`
-- ...
+Edit the `config/config.yaml` file to specify the paths to your CSV datasets. 
+The current configuration is set to 3m data for BTCUSDT from 2020-01 to 2024-01.
 
 Update these paths if necessary.
 
