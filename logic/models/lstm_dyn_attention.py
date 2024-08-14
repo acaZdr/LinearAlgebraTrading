@@ -10,10 +10,12 @@ import traceback
 import torch.optim.lr_scheduler as lr_scheduler
 from sklearn.decomposition import PCA
 
-from logic.models.abstract_model import set_up_folders, choose_n_components
+from logic.models.abstract_model import set_up_folders, choose_n_components, save_experiment_results
 from src.data_preprocessing.data_importer import import_data
 from src.utils.config_loader import load_config
 from src.utils.data_saving_and_displaying import save_and_display_results
+
+import time
 
 project_root, subfolder = set_up_folders()
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
@@ -140,10 +142,14 @@ def preprocess_data(data, config, scaler_X=None, scaler_y=None, scaler_volatilit
 
     return np.hstack((X_scaled, y_scaled.reshape(-1, 1))), volatility_scaled, scaler_X, scaler_y, scaler_volatility, pca
 
+
 def train_model(model: nn.Module, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, patience=5):
     model.to(device)
     best_val_loss = float('inf')
     patience_counter = 0
+
+    # start_time = time.time()
+    # completed_epochs = 0
 
     for epoch in range(num_epochs):
         model.train()
@@ -189,9 +195,28 @@ def train_model(model: nn.Module, train_loader, val_loader, criterion, optimizer
             patience_counter += 1
 
         if patience_counter >= patience:
-            print("Early stopping triggered")
+            logging.info("Early stopping triggered")
             break
 
+        # completed_epochs += 1
+
+    # end_time = time.time()
+    # duration = end_time - start_time
+    # average_time_per_epoch = duration / completed_epochs if completed_epochs > 0 else 0
+    # print(f"Training completed in {duration:.2f} seconds")
+    # print(f"Average time per epoch: {average_time_per_epoch:.2f} seconds")
+
+
+def evaluate_model(model, data_loader, criterion, device):
+    model.eval()
+    total_loss = 0
+    with torch.no_grad():
+        for inputs, volatility, targets in data_loader:
+            inputs, volatility, targets = inputs.to(device), volatility.to(device), targets.to(device)
+            outputs, _ = model(inputs, volatility)
+            loss = criterion(outputs.squeeze(), targets)
+            total_loss += loss.item()
+    return total_loss / len(data_loader)
 
 def evaluate_dollar_difference(model, data_loader, scaler_y, device):
     model.eval()
@@ -239,6 +264,8 @@ def main(config_path):
     # Set up logging
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+    csv_path = os.path.join(subfolder, 'times.csv')
+
     try:
         logging.info("Starting main function")
         logging.info(f"Configuration loaded from: {config_path}")
@@ -278,6 +305,7 @@ def main(config_path):
             data_loaders[dataset_name] = DataLoader(dataset, batch_size=config['batch_size'],
                                                     shuffle=(dataset_name == 'train'))
             logging.info(f"DataLoader created for {dataset_name}")
+
         input_dim = processed_data['train'].shape[1] - 1  # Exclude target column
         hidden_dim = config['hidden_dim']
         num_layers = config['num_layers']
@@ -285,6 +313,7 @@ def main(config_path):
         model = LSTMModel(input_dim=input_dim, hidden_dim=hidden_dim, num_layers=num_layers, output_dim=1,
                           dropout=dropout)
         logging.info(f"Model initialized with hidden_dim: {hidden_dim}, num_layers: {num_layers}, dropout: {dropout}")
+
         # Define the loss function and optimizer
         criterion = nn.MSELoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'])
@@ -293,8 +322,12 @@ def main(config_path):
 
         # Train the model
         logging.info("Starting model training")
+        start_time = time.time()
         train_model(model, data_loaders['train'], data_loaders['val'], criterion, optimizer, scheduler,
                     config['num_epochs'])
+        end_time = time.time()
+        training_time = end_time - start_time
+        avg_time_per_epoch = training_time / config['num_epochs']
         logging.info("Model training completed")
 
         # Evaluate the model on the test set
@@ -313,17 +346,18 @@ def main(config_path):
                 test_actuals.extend(y_batch.cpu().numpy())
                 test_predictions.extend(y_pred.squeeze().cpu().numpy())
         test_loss /= len(data_loaders['test'])
-        logging.info(f'Test Loss: {test_loss:.6f}')
+        print(f'Test Loss: {test_loss:.6f}')
 
         # Save and display results
         logging.info("Saving and displaying results")
-        save_and_display_results(test_actuals, test_predictions, subfolder)
-        logging.info(f"Results saved in {subfolder}")
-
-        # Calculate and log average dollar difference
-        logging.info("Calculating average dollar difference")
         average_dollar_difference = evaluate_dollar_difference(model, data_loaders['test'], scaler_y, device)
-        logging.info(f'Average Dollar Difference: ${average_dollar_difference:.2f}')
+        print(f'Average Dollar Difference: ${average_dollar_difference:.2f}')
+
+        # Save experiment results
+        save_experiment_results(
+            training_time, avg_time_per_epoch, test_loss, average_dollar_difference,
+            config.get('data_limit', 'N/A'), config.get('use_pca', False), csv_path
+        )
 
     except Exception as e:
         logging.error(f"An error occurred: {str(e)}")

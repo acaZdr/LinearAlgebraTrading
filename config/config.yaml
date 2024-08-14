@@ -52,7 +52,7 @@ test_data:
   - 'BTCUSDT-3m-2023-12.csv'
   - 'BTCUSDT-3m-2024-01.csv'
 download_dir: 'data'
-data_limit: 100
+data_limit: 2000
 target: 'Close'
 seq_length: 60
 batch_size: 4

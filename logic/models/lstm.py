@@ -5,13 +5,12 @@ from ta import add_all_ta_features
 from torch.utils.data import DataLoader
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.decomposition import PCA
-import matplotlib.pyplot as plt
 import os
 import logging
 import traceback
 import torch.optim.lr_scheduler as lr_scheduler
 
-from logic.models.abstract_model import choose_n_components
+from logic.models.abstract_model import choose_n_components, evaluate_dollar_difference
 from src.data_preprocessing.data_importer import import_data
 from src.utils.config_loader import load_config
 from src.utils.data_saving_and_displaying import save_and_display_results
@@ -172,51 +171,6 @@ def train_model(model: nn.Module, train_loader, val_loader, criterion, optimizer
         # if patience_counter >= patience:
         #     print("Early stopping triggered")
         #     break
-
-
-def evaluate_dollar_difference(model, data_loader, scaler_y, device):
-    model.eval()
-    total_abs_error = 0
-    count = 0
-
-    # Check the type of scaler_y
-    if not isinstance(scaler_y, MinMaxScaler):
-        raise TypeError(f"Expected MinMaxScaler, but got {type(scaler_y)}")
-
-    with torch.no_grad():
-        for X_batch, y_batch in data_loader:
-            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-            y_pred, _ = model(X_batch)
-
-            # Log shapes for debugging
-            logging.debug(f"y_pred shape: {y_pred.shape}, y_batch shape: {y_batch.shape}")
-
-            # Ensure y_pred and y_batch have the correct shape
-            y_pred = y_pred.view(-1, 1)
-            y_batch = y_batch.view(-1, 1)
-
-            # Convert to numpy and reshape if necessary
-            y_pred_np = y_pred.cpu().numpy()
-            y_batch_np = y_batch.cpu().numpy()
-
-            try:
-                # Convert predictions and targets back to the original scale
-                y_pred_unscaled = scaler_y.inverse_transform(y_pred_np)
-                y_batch_unscaled = scaler_y.inverse_transform(y_batch_np)
-
-                # Calculate the absolute error
-                total_abs_error += np.sum(np.abs(y_pred_unscaled - y_batch_unscaled))
-                count += len(y_batch)
-            except ValueError as e:
-                logging.error(f"Error in inverse transform: {str(e)}")
-                logging.error(f"y_pred_np shape: {y_pred_np.shape}, y_batch_np shape: {y_batch_np.shape}")
-                raise
-
-    if count == 0:
-        raise ValueError("No samples were processed")
-
-    average_dollar_diff = total_abs_error / count
-    return average_dollar_diff
 
 
 def main(config_path):

@@ -3,6 +3,7 @@ import logging
 import os
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 from matplotlib import pyplot as plt
@@ -154,3 +155,23 @@ def evaluate_dollar_difference(model, data_loader, scaler_y, device):
 
     average_dollar_diff = total_abs_error / count
     return average_dollar_diff
+
+
+def save_experiment_results(training_time, avg_time_per_epoch, test_loss, avg_dollar_diff, data_limit, pca,
+                            csv_path):
+    results = {
+        'Training Time (seconds)': [training_time],
+        'Average Time per Epoch (seconds)': [avg_time_per_epoch],
+        'Test Loss': [test_loss],
+        'Average Dollar Difference ($)': [avg_dollar_diff],
+        'Data Limit': [data_limit],
+        'PCA': [pca]
+    }
+
+    df = pd.DataFrame(results)
+
+    # Check if the CSV file exists to append or create it
+    if os.path.exists(csv_path):
+        df.to_csv(csv_path, mode='a', header=False, index=False)
+    else:
+        df.to_csv(csv_path, mode='w', header=True, index=False)
