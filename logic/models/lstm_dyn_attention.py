@@ -4,22 +4,17 @@ import torch.nn as nn
 from ta import add_all_ta_features
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.decomposition import PCA
-import matplotlib.pyplot as plt
 import os
 import logging
 import traceback
 import torch.optim.lr_scheduler as lr_scheduler
+
+from logic.models.abstract_model import set_up_folders
 from src.data_preprocessing.data_importer import import_data
 from src.utils.config_loader import load_config
 from src.utils.data_saving_and_displaying import save_and_display_results
 
-
-project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-subfolder = os.path.join(project_root, 'results', 'outputs')
-if not os.path.exists(subfolder):
-    os.makedirs(subfolder)
-
+project_root, subfolder = set_up_folders()
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
 
 
@@ -73,22 +68,11 @@ class CryptoDataset(Dataset):
                 self.volatility[idx:idx + self.seq_length],
                 self.data[idx + self.seq_length - 1, -1])
 
-def choose_n_components(X_scaled, variance_threshold=0.95):
-    pca = PCA().fit(X_scaled)
-    cumulative_variance_ratio = np.cumsum(pca.explained_variance_ratio_)
-    n_components = np.where(cumulative_variance_ratio >= variance_threshold)[0][0] + 1
 
-    plt.figure(figsize=(10, 6))
-    plt.plot(cumulative_variance_ratio)
-    plt.xlabel('Number of Components')
-    plt.ylabel('Cumulative Explained Variance')
-    plt.title('Explained Variance vs. Number of Components')
-    plt.axvline(x=n_components, linestyle='--', color='r',
-                label=f'n_components for {variance_threshold * 100}% variance')
-    plt.legend()
-    # plt.show()
-
-    return n_components
+def calculate_volatility(data, window_size=20):
+    data['log_return'] = np.log(data['Close']) - np.log(data['Close'].shift(1))
+    data['volatility'] = data['log_return'].rolling(window=window_size).std()
+    return data['volatility'].dropna()
 
 
 def preprocess_data(data, config, scaler_X=None, scaler_y=None, scaler_volatility=None, pca=None, fit=False):
@@ -105,7 +89,13 @@ def preprocess_data(data, config, scaler_X=None, scaler_y=None, scaler_volatilit
                        (['date', 'Open', 'High', 'Low', 'Volume', 'target'] + look_ahead_indicators)]
     feature_columns = [col for col in feature_columns if col in data.columns]
 
-    volatility = data['volatility_bbh']  # Using Bollinger Band-based volatility as an example
+    # Calculate volatility using the new method
+    data['volatility'] = calculate_volatility(data, window_size=config.get('volatility_window_size', 20))
+
+    # Drop rows with NaN values in volatility
+    data = data.dropna().reset_index(drop=True)
+
+    volatility = data['volatility']
     X = data[feature_columns].values
     y = data['target'].values
 
@@ -118,13 +108,18 @@ def preprocess_data(data, config, scaler_X=None, scaler_y=None, scaler_volatilit
 
         scaler_volatility = MinMaxScaler()
         volatility_scaled = scaler_volatility.fit_transform(volatility.values.reshape(-1, 1)).flatten()
-
     else:
         X_scaled = scaler_X.transform(X)
         y_scaled = scaler_y.transform(y.reshape(-1, 1)).flatten()
         volatility_scaled = scaler_volatility.transform(volatility.values.reshape(-1, 1)).flatten()
 
+    # Ensure no NaN values
+    assert not np.isnan(X_scaled).any(), "NaN values found in features"
+    assert not np.isnan(y_scaled).any(), "NaN values found in target"
+    assert not np.isnan(volatility_scaled).any(), "NaN values found in volatility"
+
     return np.hstack((X_scaled, y_scaled.reshape(-1, 1))), volatility_scaled, scaler_X, scaler_y, scaler_volatility, pca
+
 
 def train_model(model: nn.Module, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, patience=5):
     model.to(device)
@@ -138,6 +133,10 @@ def train_model(model: nn.Module, train_loader, val_loader, criterion, optimizer
             X_batch, volatility_batch, y_batch = X_batch.to(device), volatility_batch.to(device), y_batch.to(device)
             optimizer.zero_grad()
             y_pred, _ = model(X_batch, volatility_batch)
+
+            # Ensure no NaN values in model output
+            assert not torch.isnan(y_pred).any(), "NaN values found in model output"
+
             loss = criterion(y_pred.squeeze(), y_batch)
             loss.backward()
             optimizer.step()
@@ -149,6 +148,10 @@ def train_model(model: nn.Module, train_loader, val_loader, criterion, optimizer
             for X_batch, volatility_batch, y_batch in val_loader:
                 X_batch, volatility_batch, y_batch = X_batch.to(device), volatility_batch.to(device), y_batch.to(device)
                 y_pred, _ = model(X_batch, volatility_batch)
+
+                # Ensure no NaN values in model output
+                assert not torch.isnan(y_pred).any(), "NaN values found in model output"
+
                 loss = criterion(y_pred.squeeze(), y_batch)
                 val_loss += loss.item()
 
@@ -166,10 +169,9 @@ def train_model(model: nn.Module, train_loader, val_loader, criterion, optimizer
         else:
             patience_counter += 1
 
-        # if patience_counter >= patience:
-        #     print("Early stopping triggered")
-        #     break
-
+        if patience_counter >= patience:
+            print("Early stopping triggered")
+            break
 
 def evaluate_dollar_difference(model, data_loader, scaler_y, device):
     model.eval()
@@ -234,7 +236,6 @@ def main(config_path):
         scaler_y = None
         scaler_volatility = None
         pca = None
-        fit = False
 
         # Process each dataset (train, val, test)
         for dataset_name, data_path in datasets.items():
@@ -244,9 +245,8 @@ def main(config_path):
 
             if dataset_name == 'train':
                 processed_data[
-                    dataset_name], preprocessed_volatility, scaler_X, scaler_y, scaler_volatility, pca = preprocess_data(
-                    data, config, fit=False)
-                fit = True
+                    dataset_name], preprocessed_volatility, scaler_X, scaler_y, scaler_volatility, pca = (
+                    preprocess_data(data, config, fit=False))
             else:
                 processed_data[dataset_name], preprocessed_volatility, _, _, _, _ = preprocess_data(
                     data, config, scaler_X, scaler_y, scaler_volatility, pca, fit=True)
@@ -273,7 +273,8 @@ def main(config_path):
 
         # Train the model
         logging.info("Starting model training")
-        train_model(model, data_loaders['train'], data_loaders['val'], criterion, optimizer, scheduler, config['num_epochs'])
+        train_model(model, data_loaders['train'], data_loaders['val'], criterion, optimizer, scheduler,
+                    config['num_epochs'])
         logging.info("Model training completed")
 
         # Evaluate the model on the test set

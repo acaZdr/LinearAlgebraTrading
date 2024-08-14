@@ -1,15 +1,21 @@
 import abc
+import logging
+import os
+
 import numpy as np
 import torch
 import torch.nn as nn
+from matplotlib import pyplot as plt
 from sklearn.base import BaseEstimator
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.decomposition import PCA
 import joblib
+from ta import add_all_ta_features
 
 
-class AbstractModel(abc.ABC):
+class AbstractModel(abc.ABC, nn.Module):
     def __init__(self, config):
+        super().__init__()
         self.config = config
         self.scaler_X = StandardScaler()
         self.scaler_y = StandardScaler()
@@ -27,13 +33,8 @@ class AbstractModel(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def train(self, train_data, val_data):
+    def train(self, train_data, val_data, num_epochs):
         """Train the model using the provided training and validation data."""
-        pass
-
-    @abc.abstractmethod
-    def predict(self, data):
-        """Make predictions using the trained model."""
         pass
 
     @abc.abstractmethod
@@ -60,11 +61,96 @@ class AbstractModel(abc.ABC):
         else:
             raise NotImplementedError("Loading not implemented for this model type")
 
-    @staticmethod
-    def choose_n_components(X_scaled, variance_threshold=0.95):
-        """Choose the number of components for PCA."""
-        pca = PCA().fit(X_scaled)
-        cumulative_variance_ratio = np.cumsum(pca.explained_variance_ratio_)
-        n_components = np.where(cumulative_variance_ratio >= variance_threshold)[0][0] + 1
-        return n_components
-    
+    def get_features_and_target(self, data):
+        target = self.config['target']
+        data['target'] = data[target].shift(-1)  # Shift the target to predict next minute's close
+
+        # Calculate technical indicators
+        data = add_all_ta_features(data, "Open", "High", "Low", "Close", "Volume", fillna=True)
+
+        # Drop the last row as it won't have a target value
+        data = data.dropna().reset_index(drop=True)
+
+        look_ahead_indicators = ['trend_ichimoku_a', 'trend_ichimoku_b', 'trend_visual_ichimoku_a',
+                                 'trend_visual_ichimoku_b', 'trend_stc', 'trend_psar_up', 'trend_psar_down']
+
+        # Drop OHLCV columns from the dataset, keeping only the indicators and target
+        feature_columns = [col for col in data.columns if col not in
+                           (['date', 'Open', 'High', 'Low', 'Volume', 'target'] + look_ahead_indicators)]
+
+        # Ensure all feature columns exist in the dataframe
+        feature_columns = [col for col in feature_columns if col in data.columns]
+
+        return data[feature_columns].values, data['target'].values
+
+
+def set_up_folders():
+    project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    subfolder = os.path.join(project_root, 'results', 'outputs')
+    if not os.path.exists(subfolder):
+        os.makedirs(subfolder)
+    return project_root, subfolder
+
+
+def choose_n_components(X_scaled, variance_threshold=0.95, plot=False):
+    """Choose the number of components for PCA."""
+    pca = PCA().fit(X_scaled)
+    cumulative_variance_ratio = np.cumsum(pca.explained_variance_ratio_)
+    n_components = np.where(cumulative_variance_ratio >= variance_threshold)[0][0] + 1
+    if plot:
+        plt.figure(figsize=(10, 6))
+        plt.plot(cumulative_variance_ratio)
+        plt.xlabel('Number of Components')
+        plt.ylabel('Cumulative Explained Variance')
+        plt.title('Explained Variance vs. Number of Components')
+        plt.axvline(x=n_components, linestyle='--', color='r',
+                    label=f'n_components for {variance_threshold * 100}% variance')
+        plt.legend()
+        plt.show()
+
+    return n_components
+
+
+def evaluate_dollar_difference(model, data_loader, scaler_y, device):
+    model.eval()
+    total_abs_error = 0
+    count = 0
+
+    # Check the type of scaler_y
+    if not isinstance(scaler_y, MinMaxScaler):
+        raise TypeError(f"Expected MinMaxScaler, but got {type(scaler_y)}")
+
+    with torch.no_grad():
+        for X_batch, y_batch in data_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            y_pred, _ = model(X_batch)
+
+            # Log shapes for debugging
+            logging.debug(f"y_pred shape: {y_pred.shape}, y_batch shape: {y_batch.shape}")
+
+            # Ensure y_pred and y_batch have the correct shape
+            y_pred = y_pred.view(-1, 1)
+            y_batch = y_batch.view(-1, 1)
+
+            # Convert to numpy and reshape if necessary
+            y_pred_np = y_pred.cpu().numpy()
+            y_batch_np = y_batch.cpu().numpy()
+
+            try:
+                # Convert predictions and targets back to the original scale
+                y_pred_unscaled = scaler_y.inverse_transform(y_pred_np)
+                y_batch_unscaled = scaler_y.inverse_transform(y_batch_np)
+
+                # Calculate the absolute error
+                total_abs_error += np.sum(np.abs(y_pred_unscaled - y_batch_unscaled))
+                count += len(y_batch)
+            except ValueError as e:
+                logging.error(f"Error in inverse transform: {str(e)}")
+                logging.error(f"y_pred_np shape: {y_pred_np.shape}, y_batch_np shape: {y_batch_np.shape}")
+                raise
+
+    if count == 0:
+        raise ValueError("No samples were processed")
+
+    average_dollar_diff = total_abs_error / count
+    return average_dollar_diff
