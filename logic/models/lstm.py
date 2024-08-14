@@ -10,11 +10,12 @@ import os
 import logging
 import traceback
 import torch.optim.lr_scheduler as lr_scheduler
+
+from logic.models.abstract_model import choose_n_components
 from src.data_preprocessing.data_importer import import_data
 from src.utils.config_loader import load_config
 from src.utils.data_saving_and_displaying import save_and_display_results
-from logic.models.crypto_dataset import CryptoDataset
-
+from torch.utils.data import Dataset
 
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 subfolder = os.path.join(project_root, 'results', 'outputs')
@@ -22,6 +23,19 @@ if not os.path.exists(subfolder):
     os.makedirs(subfolder)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+
+
+class CryptoDataset(Dataset):
+    def __init__(self, data, seq_length):
+        self.data = torch.FloatTensor(data)
+        self.seq_length = seq_length
+
+    def __len__(self):
+        return len(self.data) - self.seq_length
+
+    def __getitem__(self, idx):
+        return (self.data[idx:idx + self.seq_length, :-1],
+                self.data[idx + self.seq_length - 1, -1])
 
 
 class Attention(nn.Module):
@@ -55,25 +69,6 @@ class LSTMModel(nn.Module):
         return out.view(-1, 1), attention_weights
 
 
-def choose_n_components(X_scaled, variance_threshold=0.95):
-    pca = PCA().fit(X_scaled)
-    cumulative_variance_ratio = np.cumsum(pca.explained_variance_ratio_)
-    n_components = np.where(cumulative_variance_ratio >= variance_threshold)[0][0] + 1
-
-    # Optionally, plot the explained variance
-    plt.figure(figsize=(10, 6))
-    plt.plot(cumulative_variance_ratio)
-    plt.xlabel('Number of Components')
-    plt.ylabel('Cumulative Explained Variance')
-    plt.title('Explained Variance vs. Number of Components')
-    plt.axvline(x=n_components, linestyle='--', color='r',
-                label=f'n_components for {variance_threshold * 100}% variance')
-    plt.legend()
-    # plt.show()
-
-    return n_components
-
-
 def preprocess_data(data, config, scaler_X=None, scaler_y=None, pca=None, fit=False):
     # Shift the target variable
     target = config['target']
@@ -95,6 +90,8 @@ def preprocess_data(data, config, scaler_X=None, scaler_y=None, pca=None, fit=Fa
     # Ensure all feature columns exist in the dataframe
     feature_columns = [col for col in feature_columns if col in data.columns]
 
+    logging.info(f"Number of features before PCA: {len(feature_columns)}")
+
     X = data[feature_columns].values
     y = data['target'].values
 
@@ -105,12 +102,28 @@ def preprocess_data(data, config, scaler_X=None, scaler_y=None, pca=None, fit=Fa
         scaler_y = MinMaxScaler()
         y_scaled = scaler_y.fit_transform(y.reshape(-1, 1)).flatten()
 
-        # pca = PCA(n_components=0.95)
-        # X_pca = pca.fit_transform(X_scaled)
+        if config.get('use_pca', False):
+            logging.info("PCA is enabled. Applying PCA...")
+            pca = PCA(n_components=choose_n_components(X_scaled,
+                                                       variance_threshold=config.get('variance_threshold', 0.95)))
+            X_scaled = pca.fit_transform(X_scaled)
+            logging.info(f"PCA applied. Number of components: {pca.n_components_}")
+            logging.info(f"Variance explained by PCA: {sum(pca.explained_variance_ratio_):.4f}")
+        else:
+            logging.info("PCA is not enabled.")
     else:
         X_scaled = scaler_X.transform(X)
         y_scaled = scaler_y.transform(y.reshape(-1, 1)).flatten()
-        # X_pca = pca.transform(X_scaled)
+
+        if pca is not None:
+            X_scaled = pca.transform(X_scaled)
+            logging.info(f"PCA transform applied. Number of components: {pca.n_components_}")
+
+    logging.info(f"Number of features after preprocessing: {X_scaled.shape[1]}")
+
+    # Ensure no NaN values
+    assert not np.isnan(X_scaled).any(), "NaN values found in features"
+    assert not np.isnan(y_scaled).any(), "NaN values found in target"
 
     return np.hstack((X_scaled, y_scaled.reshape(-1, 1))), scaler_X, scaler_y, pca
 
@@ -220,8 +233,8 @@ def main(config_path):
         # Process training, validation, and test data
         datasets = {
             'train': [os.path.join(project_root, 'data', path) for path in config['train_data']],
-            'val': os.path.join(project_root, 'data', config['val_data']),
-            'test': os.path.join(project_root, 'data', config['test_data'])
+            'val': [os.path.join(project_root, 'data', path) for path in config['val_data']],
+            'test': [os.path.join(project_root, 'data', path) for path in config['test_data']]
         }
 
         processed_data = {}

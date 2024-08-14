@@ -8,8 +8,9 @@ import os
 import logging
 import traceback
 import torch.optim.lr_scheduler as lr_scheduler
+from sklearn.decomposition import PCA
 
-from logic.models.abstract_model import set_up_folders
+from logic.models.abstract_model import set_up_folders, choose_n_components
 from src.data_preprocessing.data_importer import import_data
 from src.utils.config_loader import load_config
 from src.utils.data_saving_and_displaying import save_and_display_results
@@ -89,6 +90,8 @@ def preprocess_data(data, config, scaler_X=None, scaler_y=None, scaler_volatilit
                        (['date', 'Open', 'High', 'Low', 'Volume', 'target'] + look_ahead_indicators)]
     feature_columns = [col for col in feature_columns if col in data.columns]
 
+    logging.info(f"Number of features before PCA: {len(feature_columns)}")
+
     # Calculate volatility using the new method
     data['volatility'] = calculate_volatility(data, window_size=config.get('volatility_window_size', 20))
 
@@ -108,10 +111,27 @@ def preprocess_data(data, config, scaler_X=None, scaler_y=None, scaler_volatilit
 
         scaler_volatility = MinMaxScaler()
         volatility_scaled = scaler_volatility.fit_transform(volatility.values.reshape(-1, 1)).flatten()
+
+        if config.get('use_pca', False):
+            logging.info("PCA is enabled. Determining optimal number of components...")
+            n_components = choose_n_components(X_scaled,
+                                               variance_threshold=config.get('variance_threshold', 0.95))
+            pca = PCA(n_components=n_components)
+            X_scaled = pca.fit_transform(X_scaled)
+            logging.info(f"PCA applied. Number of components: {n_components}")
+            logging.info(f"Variance explained by PCA: {sum(pca.explained_variance_ratio_):.4f}")
+        else:
+            logging.info("PCA is not enabled.")
     else:
         X_scaled = scaler_X.transform(X)
         y_scaled = scaler_y.transform(y.reshape(-1, 1)).flatten()
         volatility_scaled = scaler_volatility.transform(volatility.values.reshape(-1, 1)).flatten()
+
+        if pca is not None:
+            X_scaled = pca.transform(X_scaled)
+            logging.info(f"PCA transform applied. Number of components: {pca.n_components_}")
+
+    logging.info(f"Number of features after preprocessing: {X_scaled.shape[1]}")
 
     # Ensure no NaN values
     assert not np.isnan(X_scaled).any(), "NaN values found in features"
@@ -119,7 +139,6 @@ def preprocess_data(data, config, scaler_X=None, scaler_y=None, scaler_volatilit
     assert not np.isnan(volatility_scaled).any(), "NaN values found in volatility"
 
     return np.hstack((X_scaled, y_scaled.reshape(-1, 1))), volatility_scaled, scaler_X, scaler_y, scaler_volatility, pca
-
 
 def train_model(model: nn.Module, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, patience=5):
     model.to(device)
