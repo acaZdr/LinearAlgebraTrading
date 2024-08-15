@@ -24,15 +24,13 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.ba
 class DynamicAttention(nn.Module):
     def __init__(self, hidden_dim):
         super(DynamicAttention, self).__init__()
-        self.volatility_layer = nn.Linear(1, hidden_dim, bias=False)
+        self.feature_layer = nn.Linear(2, hidden_dim, bias=False)  # Changed from 1 to 2
         self.attention = nn.Linear(hidden_dim, 1, bias=False)
 
-    def forward(self, lstm_out, volatility):
-        # Reshape volatility to (batch_size, seq_length, 1)
-        volatility = volatility.unsqueeze(-1)
-
-        # Calculate dynamic attention weights based on volatility
-        dynamic_weights = torch.tanh(self.volatility_layer(volatility))
+    def forward(self, lstm_out, volatility, volume):
+        # Combine volatility and volume
+        features = torch.cat((volatility.unsqueeze(-1), volume.unsqueeze(-1)), dim=-1)
+        dynamic_weights = torch.tanh(self.feature_layer(features))
         attention_weights = torch.softmax(self.attention(lstm_out * dynamic_weights).squeeze(-1), dim=1)
         context_vector = torch.sum(attention_weights.unsqueeze(-1) * lstm_out, dim=1)
         return context_vector, attention_weights
@@ -48,27 +46,29 @@ class LSTMModel(nn.Module):
         self.attention = DynamicAttention(hidden_dim)
         self.fc = nn.Linear(hidden_dim, output_dim)
 
-    def forward(self, x, volatility):
+    def forward(self, x, volatility, volume):  # Added volume parameter
         h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).to(x.device)
         c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).to(x.device)
         lstm_out, _ = self.lstm(x, (h0, c0))
-        context_vector, attention_weights = self.attention(lstm_out, volatility)
+        context_vector, attention_weights = self.attention(lstm_out, volatility, volume)  # Added volume
         out = self.fc(context_vector)
         return out.view(-1, 1), attention_weights
 
 
 class CryptoDataset(Dataset):
-    def __init__(self, data, volatility, seq_length):
+    def __init__(self, data, volatility, volume, seq_length):  # Added volume parameter
         self.data = torch.FloatTensor(data)
         self.volatility = torch.FloatTensor(volatility)
+        self.volume = torch.FloatTensor(volume)
         self.seq_length = seq_length
 
     def __len__(self):
-        return len(self.data) - self.seq_length
+        return len(self.data) - self.seq_length + 1
 
     def __getitem__(self, idx):
         return (self.data[idx:idx + self.seq_length, :-1],
                 self.volatility[idx:idx + self.seq_length],
+                self.volume[idx:idx + self.seq_length],  # New line
                 self.data[idx + self.seq_length - 1, -1])
 
 
@@ -78,7 +78,8 @@ def calculate_volatility(data, window_size=20):
     return data['volatility'].dropna()
 
 
-def preprocess_data(data, config, scaler_X=None, scaler_y=None, scaler_volatility=None, pca=None, fit=False):
+def preprocess_data(data, config, scaler_X=None, scaler_y=None, scaler_volatility=None, scaler_volume=None,
+                    pca=None, fit=False):
     target = config['target']
     data['target'] = data[target].shift(-1)
 
@@ -101,6 +102,8 @@ def preprocess_data(data, config, scaler_X=None, scaler_y=None, scaler_volatilit
     data = data.dropna().reset_index(drop=True)
 
     volatility = data['volatility']
+    volume = data['Volume']
+
     X = data[feature_columns].values
     y = data['target'].values
 
@@ -113,6 +116,8 @@ def preprocess_data(data, config, scaler_X=None, scaler_y=None, scaler_volatilit
 
         scaler_volatility = MinMaxScaler()
         volatility_scaled = scaler_volatility.fit_transform(volatility.values.reshape(-1, 1)).flatten()
+        scaler_volume = MinMaxScaler()
+        volume_scaled = scaler_volume.fit_transform(volume.values.reshape(-1, 1)).flatten()
 
         if config.get('use_pca', False):
             logging.info("PCA is enabled. Determining optimal number of components...")
@@ -128,6 +133,7 @@ def preprocess_data(data, config, scaler_X=None, scaler_y=None, scaler_volatilit
         X_scaled = scaler_X.transform(X)
         y_scaled = scaler_y.transform(y.reshape(-1, 1)).flatten()
         volatility_scaled = scaler_volatility.transform(volatility.values.reshape(-1, 1)).flatten()
+        volume_scaled = scaler_volume.transform(volume.values.reshape(-1, 1)).flatten()
 
         if pca is not None:
             X_scaled = pca.transform(X_scaled)
@@ -140,7 +146,8 @@ def preprocess_data(data, config, scaler_X=None, scaler_y=None, scaler_volatilit
     assert not np.isnan(y_scaled).any(), "NaN values found in target"
     assert not np.isnan(volatility_scaled).any(), "NaN values found in volatility"
 
-    return np.hstack((X_scaled, y_scaled.reshape(-1, 1))), volatility_scaled, scaler_X, scaler_y, scaler_volatility, pca
+    return (np.hstack((X_scaled, y_scaled.reshape(-1, 1))), volatility_scaled, volume_scaled,
+            scaler_X, scaler_y, scaler_volatility, scaler_volume, pca)
 
 
 def train_model(model: nn.Module, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, patience=5):
@@ -148,16 +155,13 @@ def train_model(model: nn.Module, train_loader, val_loader, criterion, optimizer
     best_val_loss = float('inf')
     patience_counter = 0
 
-    # start_time = time.time()
-    # completed_epochs = 0
-
     for epoch in range(num_epochs):
         model.train()
         train_loss = 0
-        for X_batch, volatility_batch, y_batch in train_loader:
-            X_batch, volatility_batch, y_batch = X_batch.to(device), volatility_batch.to(device), y_batch.to(device)
+        for X_batch, volatility_batch, volume_batch, y_batch in train_loader:  # Updated this line
+            X_batch, volatility_batch, volume_batch, y_batch = X_batch.to(device), volatility_batch.to(device), volume_batch.to(device), y_batch.to(device)  # Updated this line
             optimizer.zero_grad()
-            y_pred, _ = model(X_batch, volatility_batch)
+            y_pred, _ = model(X_batch, volatility_batch, volume_batch)  # Updated this line
 
             # Ensure no NaN values in model output
             assert not torch.isnan(y_pred).any(), "NaN values found in model output"
@@ -170,9 +174,9 @@ def train_model(model: nn.Module, train_loader, val_loader, criterion, optimizer
         model.eval()
         val_loss = 0
         with torch.no_grad():
-            for X_batch, volatility_batch, y_batch in val_loader:
-                X_batch, volatility_batch, y_batch = X_batch.to(device), volatility_batch.to(device), y_batch.to(device)
-                y_pred, _ = model(X_batch, volatility_batch)
+            for X_batch, volatility_batch, volume_batch, y_batch in val_loader:  # Updated this line
+                X_batch, volatility_batch, volume_batch, y_batch = X_batch.to(device), volatility_batch.to(device), volume_batch.to(device), y_batch.to(device)  # Updated this line
+                y_pred, _ = model(X_batch, volatility_batch, volume_batch)  # Updated this line
 
                 # Ensure no NaN values in model output
                 assert not torch.isnan(y_pred).any(), "NaN values found in model output"
@@ -211,12 +215,13 @@ def evaluate_model(model, data_loader, criterion, device):
     model.eval()
     total_loss = 0
     with torch.no_grad():
-        for inputs, volatility, targets in data_loader:
-            inputs, volatility, targets = inputs.to(device), volatility.to(device), targets.to(device)
-            outputs, _ = model(inputs, volatility)
+        for inputs, volatility, volume, targets in data_loader:  # Updated this line
+            inputs, volatility, volume, targets = inputs.to(device), volatility.to(device), volume.to(device), targets.to(device)  # Updated this line
+            outputs, _ = model(inputs, volatility, volume)
             loss = criterion(outputs.squeeze(), targets)
             total_loss += loss.item()
     return total_loss / len(data_loader)
+
 
 def evaluate_dollar_difference(model, data_loader, scaler_y, device):
     model.eval()
@@ -227,9 +232,9 @@ def evaluate_dollar_difference(model, data_loader, scaler_y, device):
         raise TypeError(f"Expected MinMaxScaler, but got {type(scaler_y)}")
 
     with torch.no_grad():
-        for X_batch, volatility_batch, y_batch in data_loader:
-            X_batch, volatility_batch, y_batch = X_batch.to(device), volatility_batch.to(device), y_batch.to(device)
-            y_pred, _ = model(X_batch, volatility_batch)
+        for X_batch, volatility_batch, volume_batch, y_batch in data_loader:  # Updated this line
+            X_batch, volatility_batch, volume_batch, y_batch = X_batch.to(device), volatility_batch.to(device), volume_batch.to(device), y_batch.to(device)  # Updated this line
+            y_pred, _ = model(X_batch, volatility_batch, volume_batch)  # Updated this line
 
             logging.debug(f"y_pred shape: {y_pred.shape}, y_batch shape: {y_batch.shape}")
 
@@ -291,21 +296,15 @@ def main(config_path):
             logging.info(f"Data imported for {dataset_name}, shape: {data.shape}")
 
             if dataset_name == 'train':
-                processed_data[
-                    dataset_name], preprocessed_volatility, scaler_X, scaler_y, scaler_volatility, pca = (
-                    preprocess_data(data, config, fit=False))
+                processed_data[dataset_name], preprocessed_volatility, preprocessed_volume, scaler_X, scaler_y, scaler_volatility, scaler_volume, pca = preprocess_data(data, config, fit=False)
             else:
-                processed_data[dataset_name], preprocessed_volatility, _, _, _, _ = preprocess_data(
-                    data, config, scaler_X, scaler_y, scaler_volatility, pca, fit=True)
+                processed_data[dataset_name], preprocessed_volatility, preprocessed_volume, _, _, _, _, _ = preprocess_data(data, config, scaler_X, scaler_y, scaler_volatility, scaler_volume, pca, fit=True)
 
             logging.info(f"Data preprocessed for {dataset_name}, shape: {processed_data[dataset_name].shape}")
 
-            dataset = CryptoDataset(processed_data[dataset_name], preprocessed_volatility,
-                                    seq_length=config['seq_length'])
-            data_loaders[dataset_name] = DataLoader(dataset, batch_size=config['batch_size'],
-                                                    shuffle=(dataset_name == 'train'))
+            dataset = CryptoDataset(processed_data[dataset_name], preprocessed_volatility, preprocessed_volume, seq_length=config['seq_length'])
+            data_loaders[dataset_name] = DataLoader(dataset, batch_size=config['batch_size'], shuffle=(dataset_name == 'train'))
             logging.info(f"DataLoader created for {dataset_name}")
-
         input_dim = processed_data['train'].shape[1] - 1  # Exclude target column
         hidden_dim = config['hidden_dim']
         num_layers = config['num_layers']
@@ -338,9 +337,10 @@ def main(config_path):
         test_actuals = []
         test_predictions = []
         with torch.no_grad():
-            for X_batch, volatility_batch, y_batch in data_loaders['test']:
-                X_batch, volatility_batch, y_batch = X_batch.to(device), volatility_batch.to(device), y_batch.to(device)
-                y_pred, _ = model(X_batch, volatility_batch)
+            for X_batch, volatility_batch, volume_batch, y_batch in data_loaders['test']:  # Updated this line
+                X_batch, volatility_batch, volume_batch, y_batch = X_batch.to(device), volatility_batch.to(
+                    device), volume_batch.to(device), y_batch.to(device)  # Updated this line
+                y_pred, _ = model(X_batch, volatility_batch, volume_batch)  # Updated this line
                 loss = criterion(y_pred.squeeze(), y_batch)
                 test_loss += loss.item()
                 test_actuals.extend(y_batch.cpu().numpy())
@@ -353,7 +353,6 @@ def main(config_path):
         average_dollar_difference = evaluate_dollar_difference(model, data_loaders['test'], scaler_y, device)
         print(f'Average Dollar Difference: ${average_dollar_difference:.2f}')
 
-        # Save experiment results
         save_experiment_results(
             training_time, avg_time_per_epoch, test_loss, average_dollar_difference,
             config.get('data_limit', 'N/A'), config.get('use_pca', False), csv_path

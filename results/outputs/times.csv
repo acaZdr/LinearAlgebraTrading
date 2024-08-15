@@ -8,3 +8,4 @@ Training Time (seconds), Average Time per Epoch (seconds), Test Loss, Average Do
 1362.29, 272.46, 0.000294, 666.67, 1000, True
 269.08, 53.82, 0.000105, 484.11, 1000, False
 1182.23, 78.81, 0.000667, 1382.99, 2000, True
+736.54, 49.10, 0.0000660145, 371.85, 2000, False

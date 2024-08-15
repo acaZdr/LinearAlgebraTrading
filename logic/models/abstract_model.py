@@ -157,13 +157,12 @@ def evaluate_dollar_difference(model, data_loader, scaler_y, device):
     return average_dollar_diff
 
 
-def save_experiment_results(training_time, avg_time_per_epoch, test_loss, avg_dollar_diff, data_limit, pca,
-                            csv_path):
+def save_experiment_results(training_time, avg_time_per_epoch, test_loss, avg_dollar_diff, data_limit, pca, csv_path):
     results = {
-        'Training Time (seconds)': [training_time],
-        'Average Time per Epoch (seconds)': [avg_time_per_epoch],
-        'Test Loss': [test_loss],
-        'Average Dollar Difference ($)': [avg_dollar_diff],
+        'Training Time (seconds)': [f"{training_time:.2f}"],
+        'Average Time per Epoch (seconds)': [f"{avg_time_per_epoch:.2f}"],
+        'Test Loss': [f"{test_loss:.6f}"],
+        'Average Dollar Difference ($)': [f"{avg_dollar_diff:.2f}"],
         'Data Limit': [data_limit],
         'PCA': [pca]
     }
@@ -172,6 +171,6 @@ def save_experiment_results(training_time, avg_time_per_epoch, test_loss, avg_do
 
     # Check if the CSV file exists to append or create it
     if os.path.exists(csv_path):
-        df.to_csv(csv_path, mode='a', header=False, index=False)
+        df.to_csv(csv_path, mode='a', header=False, index=False, float_format='%.6f')
     else:
-        df.to_csv(csv_path, mode='w', header=True, index=False)
+        df.to_csv(csv_path, mode='w', header=True, index=False, float_format='%.6f')
