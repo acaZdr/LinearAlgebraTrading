@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from ta import add_all_ta_features
 from torch.utils.data import Dataset, DataLoader
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import StandardScaler
 import os
 import logging
 import traceback
@@ -119,15 +119,20 @@ def preprocess_data(data: pd.DataFrame, config, scaler_X=None, scaler_y=None, sc
     y = data['target'].values
 
     if not fit:
-        scaler_X = MinMaxScaler()
+        scaler_X = StandardScaler()
         X_scaled = scaler_X.fit_transform(X)
+        # Save the scaler into a file for later use
+        if not os.path.exists(subfolder):
+            os.makedirs(subfolder)
+        torch.save(scaler_X, os.path.join(subfolder, 'scaler_X.pth'))
 
-        scaler_y = MinMaxScaler()
+        scaler_y = StandardScaler()
         y_scaled = scaler_y.fit_transform(y.reshape(-1, 1)).flatten()
+        torch.save(scaler_y, os.path.join(subfolder, 'scaler_y.pth'))
 
-        scaler_volatility = MinMaxScaler()
+        scaler_volatility = StandardScaler()
         volatility_scaled = scaler_volatility.fit_transform(volatility.values.reshape(-1, 1)).flatten()
-        scaler_volume = MinMaxScaler()
+        scaler_volume = StandardScaler()
         volume_scaled = scaler_volume.fit_transform(volume.values.reshape(-1, 1)).flatten()
 
         if config.get('use_pca', False):
@@ -239,8 +244,8 @@ def evaluate_dollar_difference(model, data_loader, scaler_y, device):
     total_abs_error = 0
     count = 0
 
-    if not isinstance(scaler_y, MinMaxScaler):
-        raise TypeError(f"Expected MinMaxScaler, but got {type(scaler_y)}")
+    if not isinstance(scaler_y, StandardScaler):
+        raise TypeError(f"Expected StandardScaler, but got {type(scaler_y)}")
 
     with torch.no_grad():
         for X_batch, volatility_batch, volume_batch, y_batch in data_loader:  # Updated this line
@@ -368,6 +373,8 @@ def main(config_path):
             training_time, avg_time_per_epoch, test_loss, average_dollar_difference,
             config.get('data_limit', 'N/A'), config.get('use_pca', False), csv_path
         )
+        
+        save_and_display_results(test_actuals, test_predictions, subfolder)
 
     except Exception as e:
         logging.error(f"An error occurred: {str(e)}")

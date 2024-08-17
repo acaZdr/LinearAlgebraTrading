@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from matplotlib import pyplot as plt
 from sklearn.base import BaseEstimator
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 import joblib
 from ta import add_all_ta_features
@@ -118,8 +118,8 @@ def evaluate_dollar_difference(model, data_loader, scaler_y, device):
     count = 0
 
     # Check the type of scaler_y
-    if not isinstance(scaler_y, MinMaxScaler):
-        raise TypeError(f"Expected MinMaxScaler, but got {type(scaler_y)}")
+    if not isinstance(scaler_y, StandardScaler):
+        raise TypeError(f"Expected StandardScaler, but got {type(scaler_y)}")
 
     with torch.no_grad():
         for X_batch, y_batch in data_loader:
