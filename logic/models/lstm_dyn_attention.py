@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 from ta import add_all_ta_features
@@ -78,10 +79,18 @@ def calculate_volatility(data, window_size=20):
     return data['volatility'].dropna()
 
 
-def preprocess_data(data, config, scaler_X=None, scaler_y=None, scaler_volatility=None, scaler_volume=None,
+def preprocess_data(data: pd.DataFrame, config, scaler_X=None, scaler_y=None, scaler_volatility=None, scaler_volume=None,
                     pca=None, fit=False):
     target = config['target']
+
+    # Calculate the difference in closing price
+    data['Close_diff'] = data['Close'].diff()
+
+    # Shift the target to predict the next period's price change
     data['target'] = data[target].shift(-1)
+
+    # Remove the first row which will have NaN for Close_diff
+    data = data.dropna().reset_index(drop=True)
 
     data = add_all_ta_features(data, "Open", "High", "Low", "Close", "Volume", fillna=True)
     data = data.dropna().reset_index(drop=True)
@@ -90,13 +99,15 @@ def preprocess_data(data, config, scaler_X=None, scaler_y=None, scaler_volatilit
                              'trend_visual_ichimoku_b', 'trend_stc', 'trend_psar_up', 'trend_psar_down']
 
     feature_columns = [col for col in data.columns if col not in
-                       (['date', 'Open', 'High', 'Low', 'Volume', 'target'] + look_ahead_indicators)]
-    feature_columns = [col for col in feature_columns if col in data.columns]
+                       (['date', 'Open', 'High', 'Low', 'Close', 'Volume', 'target'] + look_ahead_indicators)]
 
     logging.info(f"Number of features before PCA: {len(feature_columns)}")
 
     # Calculate volatility using the new method
     data['volatility'] = calculate_volatility(data, window_size=config.get('volatility_window_size', 20))
+
+    # Drop the close column
+    data = data.drop(columns=['Close'])
 
     # Drop rows with NaN values in volatility
     data = data.dropna().reset_index(drop=True)
