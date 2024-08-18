@@ -2,7 +2,6 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from ta import add_all_ta_features
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
@@ -19,13 +18,6 @@ from src.utils.data_saving_and_displaying import save_and_display_results, save_
 
 import time
 
-class MeanAbsolutePercentageError(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, y_pred, y_true):
-        epsilon = 1e-8  # Small value to avoid division by zero
-        return torch.mean(torch.abs((y_true - y_pred) / (y_true + epsilon))) * 100
 
 project_root, subfolder = set_up_folders()
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
@@ -48,6 +40,7 @@ class DynamicAttention(nn.Module):
 
 
 class LSTMModel(nn.Module):
+
     def __init__(self, input_dim, hidden_dim, num_layers, num_classes, dropout=0.5):
         super(LSTMModel, self).__init__()
         self.hidden_dim = hidden_dim
@@ -97,7 +90,7 @@ class LSTMModel(nn.Module):
 
         out = self.fc_layers(context_vector)
         out = self.softmax(out)
-        return out.view(-1, 1), attention_weights
+        return out.squeeze(1), attention_weights
 
 
 class CryptoDataset(Dataset):
