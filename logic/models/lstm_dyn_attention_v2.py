@@ -18,7 +18,6 @@ from src.utils.data_saving_and_displaying import save_and_display_results
 
 import time
 
-
 class MeanAbsolutePercentageError(nn.Module):
     def __init__(self):
         super().__init__()
@@ -29,6 +28,7 @@ class MeanAbsolutePercentageError(nn.Module):
 
 project_root, subfolder = set_up_folders()
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+print(device.type)
 
 
 class DynamicAttention(nn.Module):
@@ -52,21 +52,53 @@ class LSTMModel(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
 
-        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout)
-        self.attention = DynamicAttention(hidden_dim)
-        self.fc = nn.Linear(hidden_dim, output_dim)
+        # Time-distributed LSTM layers
+        self.lstm1 = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout)
+        self.lstm2 = nn.LSTM(hidden_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout)
 
-    def forward(self, x, volatility, volume):  # Added volume parameter
+        self.attention = DynamicAttention(hidden_dim)
+
+        # Deeper fully connected layers with Leaky ReLU, Dropout, and BatchNorm
+        self.fc_layers = nn.Sequential(
+
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LeakyReLU(0.01),
+            nn.Dropout(dropout),
+            nn.BatchNorm1d(hidden_dim),
+
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LeakyReLU(0.01),
+            nn.Dropout(dropout),
+            nn.BatchNorm1d(hidden_dim // 2),
+
+            nn.Linear(hidden_dim // 2, hidden_dim // 4),
+            nn.LeakyReLU(0.01),
+            nn.Dropout(dropout),
+            nn.BatchNorm1d(hidden_dim // 4),
+
+            nn.Linear(hidden_dim // 4, hidden_dim // 8),
+            nn.LeakyReLU(0.01),
+            nn.Dropout(dropout),
+            nn.BatchNorm1d(hidden_dim // 8),
+
+            nn.Linear(hidden_dim // 8, output_dim)
+        )
+
+    def forward(self, x, volatility, volume):
         h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).to(x.device)
         c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).to(x.device)
-        lstm_out, _ = self.lstm(x, (h0, c0))
-        context_vector, attention_weights = self.attention(lstm_out, volatility, volume)  # Added volume
-        out = self.fc(context_vector)
+
+        lstm_out, _ = self.lstm1(x, (h0, c0))
+        lstm_out, _ = self.lstm2(lstm_out)
+
+        context_vector, attention_weights = self.attention(lstm_out, volatility, volume)
+
+        out = self.fc_layers(context_vector)
         return out.view(-1, 1), attention_weights
 
 
 class CryptoDataset(Dataset):
-    def __init__(self, data, volatility, volume, seq_length):  # Added volume parameter
+    def __init__(self, data, volatility, volume, seq_length):
         self.data = torch.FloatTensor(data)
         self.volatility = torch.FloatTensor(volatility)
         self.volume = torch.FloatTensor(volume)
@@ -115,6 +147,8 @@ def preprocess_data(data: pd.DataFrame, config, scaler_X=None, scaler_y=None, sc
 
     # Calculate volatility using the new method
     data['volatility'] = calculate_volatility(data, window_size=config.get('volatility_window_size', 20))
+
+
 
     # Drop the close column
     data = data.drop(columns=['Close'])
@@ -357,12 +391,13 @@ def main(config_path):
 
         # Define the loss function and optimizer
         criterion = MeanAbsolutePercentageError()
-        optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'])
-        scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
+        optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=1e-5)
+        scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=10, verbose=True)
         logging.info(f"Loss function, optimizer, and scheduler initialized. Learning rate: {config['learning_rate']}")
 
         # Train the model
         logging.info("Starting model training")
+
         start_time = time.time()
         train_model(model, data_loaders['train'], data_loaders['val'], criterion, optimizer, scheduler,
                     config['num_epochs'])
