@@ -77,7 +77,7 @@ class LSTMModel(nn.Module):
 
             nn.Linear(hidden_dim // 8, num_classes)
         )
-        self.softmax = nn.Softmax(dim=1)
+        #self.softmax = nn.Softmax(dim=1)
 
     def forward(self, x, volatility, volume):
         h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).to(x.device)
@@ -89,12 +89,12 @@ class LSTMModel(nn.Module):
         context_vector, attention_weights = self.attention(lstm_out, volatility, volume)
 
         out = self.fc_layers(context_vector)
-        out = self.softmax(out)
-        return out.squeeze(1), attention_weights
+        #out = self.softmax(out)
+        return out, attention_weights
 
 
 class CryptoDataset(Dataset):
-    def __init__(self, data, volatility, volume, seq_length, thresholds=(-0.01, 0.01)):
+    def __init__(self, data, volatility, volume, seq_length, thresholds=(-0.15, 0.15)):
         self.data = torch.FloatTensor(data[:, :-1])  # Exclude the last column (target)
         self.volatility = torch.FloatTensor(volatility)
         self.volume = torch.FloatTensor(volume)
@@ -105,7 +105,9 @@ class CryptoDataset(Dataset):
         labels = np.zeros_like(target, dtype=int)
         labels[target > thresholds[1]] = 2  # Bullish
         labels[(target >= thresholds[0]) & (target <= thresholds[1])] = 1  # Neutral
-        return labels  # 0 is Bearish
+        for label in [0, 1, 2]:
+            logging.info(f"Label: {label}, count: {np.sum(labels == label)}")
+        return labels # Bearish
 
     def __len__(self):
         return len(self.data) - self.seq_length + 1
@@ -297,18 +299,16 @@ def evaluate_dollar_difference(model, data_loader, scaler_y, device):
         raise TypeError(f"Expected StandardScaler, but got {type(scaler_y)}")
 
     with torch.no_grad():
-        for X_batch, volatility_batch, volume_batch, y_batch in data_loader:  # Updated this line
+        for X_batch, volatility_batch, volume_batch, y_batch in data_loader:
             X_batch, volatility_batch, volume_batch, y_batch = X_batch.to(device), volatility_batch.to(
-                device), volume_batch.to(device), y_batch.to(device)  # Updated this line
-            y_pred, _ = model(X_batch, volatility_batch, volume_batch)  # Updated this line
+                device), volume_batch.to(device), y_batch.to(device)
+            y_pred, _ = model(X_batch, volatility_batch, volume_batch)
 
-            logging.debug(f"y_pred shape: {y_pred.shape}, y_batch shape: {y_batch.shape}")
-
-            y_pred = y_pred.view(-1, 1)
-            y_batch = y_batch.view(-1, 1)
+            # Ensure y_pred and y_batch have the same shape
+            y_pred = y_pred[-len(y_batch):, :]  # Take only the last predictions
 
             y_pred_np = y_pred.cpu().numpy()
-            y_batch_np = y_batch.cpu().numpy()
+            y_batch_np = y_batch.cpu().numpy().reshape(-1, 1)
 
             try:
                 y_pred_unscaled = scaler_y.inverse_transform(y_pred_np)
@@ -326,7 +326,6 @@ def evaluate_dollar_difference(model, data_loader, scaler_y, device):
 
     average_dollar_diff = total_abs_error / count
     return average_dollar_diff
-
 
 def main(config_path):
     # Load configuration
@@ -395,8 +394,10 @@ def main(config_path):
         # Define the loss function and optimizer
         criterion = nn.CrossEntropyLoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=1e-5)
-        scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=10, verbose=True)
+        scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
         logging.info(f"Loss function, optimizer, and scheduler initialized. Learning rate: {config['learning_rate']}")
+
+
 
         # Train the model
         logging.info("Starting model training")
