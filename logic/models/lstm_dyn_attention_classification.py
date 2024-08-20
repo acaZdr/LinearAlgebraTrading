@@ -16,6 +16,12 @@ from src.data_preprocessing.data_importer import import_data
 from src.utils.config_loader import load_config
 from src.utils.data_saving_and_displaying import save_and_display_results, save_and_display_results_classification
 
+from ta.trend import MACD, EMAIndicator
+from ta.momentum import RSIIndicator
+from ta.volatility import BollingerBands
+from ta.volume import OnBalanceVolumeIndicator
+
+
 import time
 
 
@@ -49,6 +55,7 @@ class LSTMModel(nn.Module):
         # Time-distributed LSTM layers
         self.lstm1 = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout)
         self.lstm2 = nn.LSTM(hidden_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout)
+        self.lstm3 = nn.LSTM(hidden_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout)
 
         self.attention = DynamicAttention(hidden_dim)
 
@@ -93,21 +100,41 @@ class LSTMModel(nn.Module):
         return out, attention_weights
 
 
+
+
 class CryptoDataset(Dataset):
-    def __init__(self, data, volatility, volume, seq_length, thresholds=(-0.15, 0.15)):
+    def __init__(self, data, volatility, volume, seq_length):
         self.data = torch.FloatTensor(data[:, :-1])  # Exclude the last column (target)
         self.volatility = torch.FloatTensor(volatility)
         self.volume = torch.FloatTensor(volume)
         self.seq_length = seq_length
-        self.labels = torch.LongTensor(self._create_labels(data[:, -1], thresholds))
+        self.labels = torch.LongTensor(self._create_labels(data[:, -1]))
 
-    def _create_labels(self, target, thresholds):
-        labels = np.zeros_like(target, dtype=int)
-        labels[target > thresholds[1]] = 2  # Bullish
-        labels[(target >= thresholds[0]) & (target <= thresholds[1])] = 1  # Neutral
-        for label in [0, 1, 2]:
-            logging.info(f"Label: {label}, count: {np.sum(labels == label)}")
-        return labels # Bearish
+        expected_length = len(self)
+        if len(self.labels) > expected_length:
+            self.labels = self.labels[:expected_length]
+
+
+    def _create_labels(self, target):
+        # Calculate the Simple Moving Average (SMA) over the last 'seq_length' time points
+        sma = np.convolve(target, np.ones(self.seq_length) / self.seq_length, mode='valid')
+
+        # Calculate the difference between the current target value and the SMA
+        diff_to_sma = target[-len(sma):] - sma  # Adjust to match the size of the SMA array
+
+        # Calculate the 33rd and 67th percentiles
+        lower_bound = np.percentile(diff_to_sma, 33)
+        upper_bound = np.percentile(diff_to_sma, 67)
+
+        # Initialize labels array with zeros
+        labels = np.zeros_like(diff_to_sma, dtype=int)
+
+        # Label assignment based on percentile ranges
+        labels[diff_to_sma > upper_bound] = 2  # Top 33% (Bullish)
+        labels[(diff_to_sma >= lower_bound) & (diff_to_sma <= upper_bound)] = 1  # Middle 33% (Neutral)
+        labels[diff_to_sma < lower_bound] = 0  # Bottom 33% (Bearish)
+
+        return labels
 
     def __len__(self):
         return len(self.data) - self.seq_length + 1
@@ -116,7 +143,40 @@ class CryptoDataset(Dataset):
         return (self.data[idx:idx + self.seq_length],
                 self.volatility[idx:idx + self.seq_length],
                 self.volume[idx:idx + self.seq_length],
-                self.labels[idx + self.seq_length - 1])
+                self.labels[idx])
+
+
+def add_custom_ta_features(data):
+    # MACD
+    macd = MACD(close=data['Close'])
+    data['macd'] = macd.macd()
+    data['macd_signal'] = macd.macd_signal()
+    data['macd_diff'] = macd.macd_diff()
+
+    # EMA
+    data['ema_9'] = EMAIndicator(close=data['Close'], window=9).ema_indicator()
+    data['ema_21'] = EMAIndicator(close=data['Close'], window=21).ema_indicator()
+    data['ema_50'] = EMAIndicator(close=data['Close'], window=50).ema_indicator()
+    data['ema_200'] = EMAIndicator(close=data['Close'], window=200).ema_indicator()
+
+    # RSI
+    data['rsi_14'] = RSIIndicator(close=data['Close'], window=14).rsi()
+    data['rsi_21'] = RSIIndicator(close=data['Close'], window=21).rsi()
+
+    # Bollinger Bands
+    bb = BollingerBands(close=data['Close'])
+    data['bb_high'] = bb.bollinger_hband()
+    data['bb_low'] = bb.bollinger_lband()
+    data['bb_mid'] = bb.bollinger_mavg()
+    data['bb_width'] = (data['bb_high'] - data['bb_low']) / data['bb_mid']
+
+    # On-Balance Volume
+    data['obv'] = OnBalanceVolumeIndicator(close=data['Close'], volume=data['Volume']).on_balance_volume()
+
+    # Price rate of change
+    data['price_roc'] = data['Close'].pct_change(periods=12)
+
+    return data
 
 
 def calculate_volatility(data, window_size=20):
@@ -125,35 +185,44 @@ def calculate_volatility(data, window_size=20):
     return data['volatility'].dropna()
 
 
-def preprocess_data(data: pd.DataFrame, config, scaler_X=None, scaler_y=None, scaler_volatility=None,
-                    scaler_volume=None,
-                    pca=None, fit=False):
+def preprocess_data(data: pd.DataFrame, config, scaler_X=None, scaler_y=None, scaler_volatility=None, scaler_volume=None, pca=None, fit=False):
     target = config['target']
 
-    # Calculate the difference in closing price
+    # # Calculate the difference in closing price
     data['Close_diff'] = data['Close'].diff()
 
-    # Shift the target to predict the next period's price change
-    data['target'] = data['Close_diff'].shift(-1)
+    data['target'] = data[target].shift(-1)
+    #
+    # data['Average_Close_diff'] = data['Close_diff'].abs().rolling(window=26).mean()
+    # # Shift the target to predict the next period's price change
+    # data['target'] = (
+    #         (data['Close_diff'].shift(-1) > 0.05 * data['Average_Close_diff']).astype(int) +
+    #         (data['Close_diff'].shift(-1) < -0.05 * data['Average_Close_diff']).astype(int) * (-1) + 1
+    # ).astype(int)
 
     # Remove the first row which will have NaN for Close_diff
     data = data.dropna().reset_index(drop=True)
 
+    # data = add_custom_ta_features(data)
+    # data = data.dropna().reset_index(drop=True)
+    #
+    # feature_columns = ['macd', 'macd_signal', 'macd_diff',
+    #                    'ema_9', 'ema_21', 'ema_50', 'ema_200',
+    #                    'rsi_14', 'rsi_21',
+    #                    'bb_high', 'bb_low', 'bb_mid', 'bb_width',
+    #                    'obv', 'price_roc']
+
     data = add_all_ta_features(data, "Open", "High", "Low", "Close", "Volume", fillna=True)
     data = data.dropna().reset_index(drop=True)
 
-    look_ahead_indicators = ['trend_ichimoku_a', 'trend_ichimoku_b', 'trend_visual_ichimoku_a',
-                             'trend_visual_ichimoku_b', 'trend_stc', 'trend_psar_up', 'trend_psar_down']
+    look_ahead_indicators = ['trend_ichimoku_a', 'trend_ichimoku_b', 'trend_visual_ichimoku_a', 'trend_visual_ichimoku_b', 'trend_stc', 'trend_psar_up', 'trend_psar_down']
 
-    feature_columns = [col for col in data.columns if col not in
-                       (['date', 'Open', 'High', 'Low', 'Close', 'Volume', 'target'] + look_ahead_indicators)]
+    feature_columns = [col for col in data.columns if col not in (['date', 'Open', 'High', 'Low', 'Close', 'Volume', 'target', 'Average_Close_diff'] + look_ahead_indicators)]
 
     logging.info(f"Number of features before PCA: {len(feature_columns)}")
 
     # Calculate volatility using the new method
     data['volatility'] = calculate_volatility(data, window_size=config.get('volatility_window_size', 20))
-
-
 
     # Drop the close column
     data = data.drop(columns=['Close'])
@@ -170,9 +239,6 @@ def preprocess_data(data: pd.DataFrame, config, scaler_X=None, scaler_y=None, sc
     if not fit:
         scaler_X = StandardScaler()
         X_scaled = scaler_X.fit_transform(X)
-        # Save the scaler into a file for later use
-        if not os.path.exists(subfolder):
-            os.makedirs(subfolder)
         torch.save(scaler_X, os.path.join(subfolder, 'scaler_X.pth'))
 
         scaler_y = StandardScaler()
@@ -185,15 +251,9 @@ def preprocess_data(data: pd.DataFrame, config, scaler_X=None, scaler_y=None, sc
         volume_scaled = scaler_volume.fit_transform(volume.values.reshape(-1, 1)).flatten()
 
         if config.get('use_pca', False):
-            logging.info("PCA is enabled. Determining optimal number of components...")
-            n_components = choose_n_components(X_scaled,
-                                               variance_threshold=config.get('variance_threshold', 0.95))
-            pca = PCA(n_components=n_components)
+            pca = PCA(n_components=choose_n_components(X_scaled))
             X_scaled = pca.fit_transform(X_scaled)
-            logging.info(f"PCA applied. Number of components: {n_components}")
-            logging.info(f"Variance explained by PCA: {sum(pca.explained_variance_ratio_):.4f}")
-        else:
-            logging.info("PCA is not enabled.")
+            torch.save(pca, os.path.join(subfolder, 'pca.pth'))
     else:
         X_scaled = scaler_X.transform(X)
         y_scaled = scaler_y.transform(y.reshape(-1, 1)).flatten()
@@ -202,7 +262,6 @@ def preprocess_data(data: pd.DataFrame, config, scaler_X=None, scaler_y=None, sc
 
         if pca is not None:
             X_scaled = pca.transform(X_scaled)
-            logging.info(f"PCA transform applied. Number of components: {pca.n_components_}")
 
     logging.info(f"Number of features after preprocessing: {X_scaled.shape[1]}")
 
@@ -211,9 +270,7 @@ def preprocess_data(data: pd.DataFrame, config, scaler_X=None, scaler_y=None, sc
     assert not np.isnan(y_scaled).any(), "NaN values found in target"
     assert not np.isnan(volatility_scaled).any(), "NaN values found in volatility"
 
-    return (np.hstack((X_scaled, y_scaled.reshape(-1, 1))), volatility_scaled, volume_scaled,
-            scaler_X, scaler_y, scaler_volatility, scaler_volume, pca)
-
+    return np.hstack((X_scaled, y_scaled.reshape(-1, 1))), volatility_scaled, volume_scaled, scaler_X, scaler_y, scaler_volatility, scaler_volume, pca
 
 def train_model(model: nn.Module, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, patience=5):
     model.to(device)
@@ -223,15 +280,14 @@ def train_model(model: nn.Module, train_loader, val_loader, criterion, optimizer
     for epoch in range(num_epochs):
         model.train()
         train_loss = 0
-        for X_batch, volatility_batch, volume_batch, y_batch in train_loader:  # Updated this line
+        for X_batch, volatility_batch, volume_batch, y_batch in train_loader:
             X_batch, volatility_batch, volume_batch, y_batch = X_batch.to(device), volatility_batch.to(
-                device), volume_batch.to(device), y_batch.to(device)  # Updated this line
+                device), volume_batch.to(device), y_batch.to(device)
             optimizer.zero_grad()
-            y_pred, _ = model(X_batch, volatility_batch, volume_batch)  # Updated this line
+            y_pred, _ = model(X_batch, volatility_batch, volume_batch)
 
             # Ensure no NaN values in model output
             assert not torch.isnan(y_pred).any(), "NaN values found in model output"
-
             loss = criterion(y_pred.squeeze(), y_batch)
             loss.backward()
             optimizer.step()
@@ -304,8 +360,7 @@ def evaluate_dollar_difference(model, data_loader, scaler_y, device):
                 device), volume_batch.to(device), y_batch.to(device)
             y_pred, _ = model(X_batch, volatility_batch, volume_batch)
 
-            # Ensure y_pred and y_batch have the same shape
-            y_pred = y_pred[-len(y_batch):, :]  # Take only the last predictions
+            y_pred = y_pred[-len(y_batch):, :]
 
             y_pred_np = y_pred.cpu().numpy()
             y_batch_np = y_batch.cpu().numpy().reshape(-1, 1)
@@ -391,8 +446,15 @@ def main(config_path):
                           dropout=dropout)
         logging.info(f"Model initialized with hidden_dim: {hidden_dim}, num_layers: {num_layers}, dropout: {dropout}")
 
+        # train_labels = [data_loaders['train'].dataset[i][3].item() for i in range(len(data_loaders['train'].dataset))]
+        # class_counts = torch.bincount(torch.tensor(train_labels))
+        # total_samples = len(train_labels)
+        # class_weights = 1.0 / (class_counts.float() / total_samples)
+        # class_weights = class_weights / class_weights.sum()
+
+
         # Define the loss function and optimizer
-        criterion = nn.CrossEntropyLoss()
+        criterion = nn.CrossEntropyLoss()#weight=class_weights.to(device))
         optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=1e-5)
         scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
         logging.info(f"Loss function, optimizer, and scheduler initialized. Learning rate: {config['learning_rate']}")
@@ -430,6 +492,7 @@ def main(config_path):
         print(f'Test Loss: {test_loss:.6f}')
 
         # Save and display results
+
         logging.info("Saving and displaying results")
         save_and_display_results(test_actuals, test_predictions, subfolder)
         average_dollar_difference = evaluate_dollar_difference(model, data_loaders['test'], scaler_y, device)

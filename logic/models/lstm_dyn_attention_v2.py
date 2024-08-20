@@ -18,13 +18,28 @@ from src.utils.data_saving_and_displaying import save_and_display_results
 
 import time
 
-class MeanAbsolutePercentageError(nn.Module):
-    def __init__(self):
+
+class ModifiedMAPE(nn.Module):
+    def __init__(self, alpha=0.5, beta=1.0):
         super().__init__()
+        self.alpha = alpha  # Controls the penalty for underestimation
+        self.beta = beta  # Controls the overall scale of the loss
 
     def forward(self, y_pred, y_true):
         epsilon = 1e-8  # Small value to avoid division by zero
-        return torch.mean(torch.abs((y_true - y_pred) / (y_true + epsilon))) * 100
+
+        # Calculate percentage error
+        percentage_error = (y_true - y_pred) / (torch.abs(y_true) + epsilon)
+
+        # Apply asymmetric penalty
+        penalized_error = torch.where(percentage_error > 0,
+                                      percentage_error,
+                                      self.alpha * percentage_error)
+
+        # Apply sigmoid to bound the loss and reduce impact of extreme values
+        bounded_error = torch.sigmoid(self.beta * torch.abs(penalized_error)) - 0.5
+
+        return torch.mean(bounded_error) * 100
 
 project_root, subfolder = set_up_folders()
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
@@ -390,7 +405,8 @@ def main(config_path):
         logging.info(f"Model initialized with hidden_dim: {hidden_dim}, num_layers: {num_layers}, dropout: {dropout}")
 
         # Define the loss function and optimizer
-        criterion = MeanAbsolutePercentageError()
+        criterion = ModifiedMAPE(alpha=0.2, beta=2.0)
+
         optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=1e-5)
         scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=10, verbose=True)
         logging.info(f"Loss function, optimizer, and scheduler initialized. Learning rate: {config['learning_rate']}")
@@ -448,3 +464,5 @@ def main(config_path):
 if __name__ == "__main__":
     config_path = '../../config/config.yaml'
     main(config_path)
+
+

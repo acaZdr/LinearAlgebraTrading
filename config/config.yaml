@@ -1,5 +1,35 @@
 # config.yaml
 train_data:
+  - 'BTCUSDT-3m-2017-08.csv'
+  - 'BTCUSDT-3m-2017-09.csv'
+  - 'BTCUSDT-3m-2017-10.csv'
+  - 'BTCUSDT-3m-2017-11.csv'
+  - 'BTCUSDT-3m-2017-12.csv'
+  - 'BTCUSDT-3m-2018-01.csv'
+  - 'BTCUSDT-3m-2018-02.csv'
+  - 'BTCUSDT-3m-2018-03.csv'
+  - 'BTCUSDT-3m-2018-04.csv'
+  - 'BTCUSDT-3m-2018-05.csv'
+  - 'BTCUSDT-3m-2018-06.csv'
+  - 'BTCUSDT-3m-2018-07.csv'
+
+  - 'BTCUSDT-3m-2018-08.csv'
+  - 'BTCUSDT-3m-2018-09.csv'
+  - 'BTCUSDT-3m-2018-10.csv'
+  - 'BTCUSDT-3m-2018-11.csv'
+  - 'BTCUSDT-3m-2018-12.csv'
+  - 'BTCUSDT-3m-2019-01.csv'
+  - 'BTCUSDT-3m-2019-02.csv'
+  - 'BTCUSDT-3m-2019-03.csv'
+  - 'BTCUSDT-3m-2019-04.csv'
+  - 'BTCUSDT-3m-2019-05.csv'
+  - 'BTCUSDT-3m-2019-06.csv'
+  - 'BTCUSDT-3m-2019-07.csv'
+  - 'BTCUSDT-3m-2019-08.csv'
+  - 'BTCUSDT-3m-2019-09.csv'
+  - 'BTCUSDT-3m-2019-10.csv'
+  - 'BTCUSDT-3m-2019-11.csv'
+  - 'BTCUSDT-3m-2019-12.csv'
   - 'BTCUSDT-3m-2020-01.csv'
   - 'BTCUSDT-3m-2020-02.csv'
   - 'BTCUSDT-3m-2020-03.csv'
@@ -12,6 +42,7 @@ train_data:
   - 'BTCUSDT-3m-2020-10.csv'
   - 'BTCUSDT-3m-2020-11.csv'
   - 'BTCUSDT-3m-2020-12.csv'
+val_data:
   - 'BTCUSDT-3m-2021-01.csv'
   - 'BTCUSDT-3m-2021-02.csv'
   - 'BTCUSDT-3m-2021-03.csv'
@@ -24,7 +55,6 @@ train_data:
   - 'BTCUSDT-3m-2021-10.csv'
   - 'BTCUSDT-3m-2021-11.csv'
   - 'BTCUSDT-3m-2021-12.csv'
-val_data:
   - 'BTCUSDT-3m-2022-01.csv'
   - 'BTCUSDT-3m-2022-02.csv'
   - 'BTCUSDT-3m-2022-03.csv'
@@ -51,14 +81,18 @@ test_data:
   - 'BTCUSDT-3m-2023-11.csv'
   - 'BTCUSDT-3m-2023-12.csv'
   - 'BTCUSDT-3m-2024-01.csv'
+  - 'BTCUSDT-3m-2024-02.csv'
+  - 'BTCUSDT-3m-2024-03.csv'
+  - 'BTCUSDT-3m-2024-04.csv'
+  - 'BTCUSDT-3m-2024-05.csv'
 download_dir: 'data'
-data_limit: 2000
-target: 'Close'
+#data_limit: 1000
+target: 'Close_diff'
 seq_length: 60
-batch_size: 4
+batch_size: 32
 hidden_dim: 64
 num_layers: 3
-learning_rate: 0.001
-num_epochs: 15
+learning_rate: 0.01
+num_epochs: 10
 dropout: 0.3
-use_pca: True
+use_pca: False
