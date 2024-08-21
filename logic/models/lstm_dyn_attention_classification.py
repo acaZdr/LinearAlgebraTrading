@@ -21,9 +21,7 @@ from ta.momentum import RSIIndicator
 from ta.volatility import BollingerBands
 from ta.volume import OnBalanceVolumeIndicator
 
-
 import time
-
 
 project_root, subfolder = set_up_folders()
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
@@ -47,15 +45,18 @@ class DynamicAttention(nn.Module):
 
 class LSTMModel(nn.Module):
 
-    def __init__(self, input_dim, hidden_dim, num_layers, num_classes, dropout=0.5):
+    def __init__(self, input_dim, hidden_dim, num_layers, num_classes, dropout=0.0, use_attention=True):
         super(LSTMModel, self).__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
+        self.use_attention = use_attention
 
         # Time-distributed LSTM layers
         self.lstm1 = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout)
         self.lstm2 = nn.LSTM(hidden_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout)
         self.lstm3 = nn.LSTM(hidden_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout)
+        self.lstm4 = nn.LSTM(hidden_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout)
+
 
         self.attention = DynamicAttention(hidden_dim)
 
@@ -82,7 +83,12 @@ class LSTMModel(nn.Module):
             nn.Dropout(dropout),
             nn.BatchNorm1d(hidden_dim // 8),
 
-            nn.Linear(hidden_dim // 8, num_classes)
+            nn.Linear(hidden_dim // 8, hidden_dim // 16),
+            nn.LeakyReLU(0.01),
+            nn.Dropout(dropout),
+            nn.BatchNorm1d(hidden_dim // 16),
+
+            nn.Linear(hidden_dim // 16, num_classes)
         )
         #self.softmax = nn.Softmax(dim=1)
 
@@ -92,20 +98,31 @@ class LSTMModel(nn.Module):
 
         lstm_out, _ = self.lstm1(x, (h0, c0))
         lstm_out, _ = self.lstm2(lstm_out)
+        # lstm_out, _ = self.lstm3(lstm_out)
+        # lstm_out, _ = self.lstm4(lstm_out)
 
-        context_vector, attention_weights = self.attention(lstm_out, volatility, volume)
+
+        if self.use_attention:
+            context_vector, attention_weights = self.attention(lstm_out, volatility, volume)
+        else:
+            # Uniform attention weights
+            seq_len = lstm_out.size(1)
+            uniform_attention_weights = torch.ones(lstm_out.size(0), seq_len, device=lstm_out.device) / seq_len
+
+            # Compute context vector using uniform weights
+            context_vector = torch.sum(uniform_attention_weights.unsqueeze(-1) * lstm_out, dim=1)
+            attention_weights = uniform_attention_weights
 
         out = self.fc_layers(context_vector)
         #out = self.softmax(out)
         return out, attention_weights
 
 
-
-
 class CryptoDataset(Dataset):
     def __init__(self, data, volatility, volume, seq_length):
         self.data = torch.FloatTensor(data[:, :-1])  # Exclude the last column (target)
         self.volatility = torch.FloatTensor(volatility)
+
         self.volume = torch.FloatTensor(volume)
         self.seq_length = seq_length
         self.labels = torch.LongTensor(self._create_labels(data[:, -1]))
@@ -113,7 +130,6 @@ class CryptoDataset(Dataset):
         expected_length = len(self)
         if len(self.labels) > expected_length:
             self.labels = self.labels[:expected_length]
-
 
     def _create_labels(self, target):
         # Calculate the Simple Moving Average (SMA) over the last 'seq_length' time points
@@ -133,6 +149,9 @@ class CryptoDataset(Dataset):
         labels[diff_to_sma > upper_bound] = 2  # Top 33% (Bullish)
         labels[(diff_to_sma >= lower_bound) & (diff_to_sma <= upper_bound)] = 1  # Middle 33% (Neutral)
         labels[diff_to_sma < lower_bound] = 0  # Bottom 33% (Bearish)
+
+        # print count of each label [0,1,2]
+        logging.info(f"Label counts: {np.bincount(labels)}")
 
         return labels
 
@@ -185,13 +204,42 @@ def calculate_volatility(data, window_size=20):
     return data['volatility'].dropna()
 
 
-def preprocess_data(data: pd.DataFrame, config, scaler_X=None, scaler_y=None, scaler_volatility=None, scaler_volume=None, pca=None, fit=False):
+penalty_matrix = torch.tensor([
+    [0.0, 1.5, 2.0],
+    [1.0, 0.0, 1.0],
+    [2.0, 1.5, 0.0]
+], device=device)
+
+class CustomLoss(nn.Module):
+    def __init__(self, penalty_matrix):
+        super(CustomLoss, self).__init__()
+        self.penalty_matrix = penalty_matrix
+        self.cross_entropy = nn.CrossEntropyLoss(reduction='none')  # Use reduction='none' to apply penalties later
+
+    def forward(self, outputs, targets):
+        # Calculate the standard cross-entropy loss
+        ce_loss = self.cross_entropy(outputs, targets)
+
+        # Get the predicted class (class with the highest score)
+        _, preds = torch.max(outputs, dim=1)
+
+        # Apply the penalties
+        penalties = self.penalty_matrix[targets, preds]
+        penalized_loss = ce_loss * penalties
+
+        # Return the mean penalized loss
+        return torch.mean(penalized_loss)
+
+
+def preprocess_data(data: pd.DataFrame, config, scaler_X=None, scaler_y=None, scaler_volatility=None,
+                    scaler_volume=None, pca=None, fit=False):
     target = config['target']
 
     # # Calculate the difference in closing price
     data['Close_diff'] = data['Close'].diff()
 
     data['target'] = data[target].shift(-1)
+
     #
     # data['Average_Close_diff'] = data['Close_diff'].abs().rolling(window=26).mean()
     # # Shift the target to predict the next period's price change
@@ -215,9 +263,12 @@ def preprocess_data(data: pd.DataFrame, config, scaler_X=None, scaler_y=None, sc
     data = add_all_ta_features(data, "Open", "High", "Low", "Close", "Volume", fillna=True)
     data = data.dropna().reset_index(drop=True)
 
-    look_ahead_indicators = ['trend_ichimoku_a', 'trend_ichimoku_b', 'trend_visual_ichimoku_a', 'trend_visual_ichimoku_b', 'trend_stc', 'trend_psar_up', 'trend_psar_down']
+    look_ahead_indicators = ['trend_ichimoku_a', 'trend_ichimoku_b', 'trend_visual_ichimoku_a',
+                             'trend_visual_ichimoku_b', 'trend_stc', 'trend_psar_up', 'trend_psar_down']
 
-    feature_columns = [col for col in data.columns if col not in (['date', 'Open', 'High', 'Low', 'Close', 'Volume', 'target', 'Average_Close_diff'] + look_ahead_indicators)]
+    feature_columns = [col for col in data.columns if col not in (
+                ['date', 'Open', 'High', 'Low', 'Close', 'Volume', 'target',
+                 'Average_Close_diff'] + look_ahead_indicators)]
 
     logging.info(f"Number of features before PCA: {len(feature_columns)}")
 
@@ -270,7 +321,9 @@ def preprocess_data(data: pd.DataFrame, config, scaler_X=None, scaler_y=None, sc
     assert not np.isnan(y_scaled).any(), "NaN values found in target"
     assert not np.isnan(volatility_scaled).any(), "NaN values found in volatility"
 
-    return np.hstack((X_scaled, y_scaled.reshape(-1, 1))), volatility_scaled, volume_scaled, scaler_X, scaler_y, scaler_volatility, scaler_volume, pca
+    return np.hstack((X_scaled, y_scaled.reshape(-1,
+                                                 1))), volatility_scaled, volume_scaled, scaler_X, scaler_y, scaler_volatility, scaler_volume, pca
+
 
 def train_model(model: nn.Module, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, patience=5):
     model.to(device)
@@ -288,7 +341,7 @@ def train_model(model: nn.Module, train_loader, val_loader, criterion, optimizer
 
             # Ensure no NaN values in model output
             assert not torch.isnan(y_pred).any(), "NaN values found in model output"
-            loss = criterion(y_pred.squeeze(), y_batch)
+            loss = criterion(y_pred, y_batch)
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
@@ -296,9 +349,9 @@ def train_model(model: nn.Module, train_loader, val_loader, criterion, optimizer
         model.eval()
         val_loss = 0
         with torch.no_grad():
-            for X_batch, volatility_batch, volume_batch, y_batch in train_loader:
+            for X_batch, volatility_batch, volume_batch, y_batch in val_loader:
                 X_batch, volatility_batch, volume_batch, y_batch = X_batch.to(device), volatility_batch.to(
-                    device), volume_batch.to(device), y_batch.to(device)  # Updated this line
+                    device), volume_batch.to(device), y_batch.to(device)
                 y_pred, _ = model(X_batch, volatility_batch, volume_batch)
                 # Ensure no NaN values in model output
                 assert not torch.isnan(y_pred).any(), "NaN values found in model output"
@@ -382,6 +435,7 @@ def evaluate_dollar_difference(model, data_loader, scaler_y, device):
     average_dollar_diff = total_abs_error / count
     return average_dollar_diff
 
+
 def main(config_path):
     # Load configuration
     config = load_config(config_path)
@@ -440,10 +494,11 @@ def main(config_path):
         input_dim = processed_data['train'].shape[1] - 1  # Exclude target column
         hidden_dim = config['hidden_dim']
         num_layers = config['num_layers']
-        dropout = config['dropout']
+        dropout = config.get('dropout', 0)
+        use_attention = config['use_attention']
         num_classes = 3
         model = LSTMModel(input_dim=input_dim, hidden_dim=hidden_dim, num_layers=num_layers, num_classes=num_classes,
-                          dropout=dropout)
+                          dropout=dropout, use_attention=use_attention)
         logging.info(f"Model initialized with hidden_dim: {hidden_dim}, num_layers: {num_layers}, dropout: {dropout}")
 
         # train_labels = [data_loaders['train'].dataset[i][3].item() for i in range(len(data_loaders['train'].dataset))]
@@ -452,14 +507,12 @@ def main(config_path):
         # class_weights = 1.0 / (class_counts.float() / total_samples)
         # class_weights = class_weights / class_weights.sum()
 
-
         # Define the loss function and optimizer
-        criterion = nn.CrossEntropyLoss()#weight=class_weights.to(device))
-        optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=1e-5)
+        criterion = CustomLoss(penalty_matrix)  #weight=class_weights.to(device))
+        optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'],
+                                     weight_decay=config.get('weight_decay', 0))
         scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
         logging.info(f"Loss function, optimizer, and scheduler initialized. Learning rate: {config['learning_rate']}")
-
-
 
         # Train the model
         logging.info("Starting model training")

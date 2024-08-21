@@ -86,13 +86,17 @@ test_data:
   - 'BTCUSDT-3m-2024-04.csv'
   - 'BTCUSDT-3m-2024-05.csv'
 download_dir: 'data'
-#data_limit: 1000
+#data_limit: 2000
 target: 'Close_diff'
 seq_length: 60
-batch_size: 32
+batch_size: 16
 hidden_dim: 64
 num_layers: 3
 learning_rate: 0.01
 num_epochs: 10
+
+use_pca: True
+use_attention: True
+
 dropout: 0.3
-use_pca: False
+weight_decay: 0.0001
