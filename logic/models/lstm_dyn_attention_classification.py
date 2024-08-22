@@ -200,51 +200,44 @@ def compute_grad_norms(model):
     return total_norm
 
 
-# penalty_matrix = torch.tensor([
-#     [0.0, 1.5, 1.0],
-#     [1.0, 0.0, 1.0],
-#     [1.0, 1.5, 0.0]
-# ], device=device)
+def time_series_cross_validation(data, n_splits=10, train_size=6, val_size=2, test_size=2):
+    total_size = len(data)
+    segment_size = total_size // n_splits
 
-penalty_matrix = torch.tensor([
-    [0.0, 1.0, 1.0],
-    [1.0, 0.0, 1.0],
-    [1.0, 1.0, 0.0]
-], device=device)
+    for i in range(n_splits - (train_size + val_size + test_size) + 1):
+        train_start = i * segment_size
+        train_end = (i + train_size) * segment_size
+        val_end = (i + train_size + val_size) * segment_size
+        test_end = (i + train_size + val_size + test_size) * segment_size
 
-class CustomLoss(nn.Module):
-    def __init__(self, penalty_matrix):
-        super(CustomLoss, self).__init__()
-        self.penalty_matrix = penalty_matrix
-        self.cross_entropy = nn.CrossEntropyLoss(reduction='none')  # Use reduction='none' to apply penalties later
+        train_data = data[train_start:train_end]
+        val_data = data[train_end:val_end]
+        test_data = data[val_end:test_end]
 
-    def forward(self, outputs, targets):
-        # Calculate the standard cross-entropy loss
-        ce_loss = self.cross_entropy(outputs, targets)
+        yield train_data, val_data, test_data
 
-        # Get the predicted class (class with the highest score)
-        _, preds = torch.max(outputs, dim=1)
 
-        # Apply the penalties
-        penalties = self.penalty_matrix[targets, preds]
-        penalized_loss = ce_loss * penalties
+def aggregate_and_save_cv_results(cv_results, subfolder):
+    all_test_actuals = []
+    all_test_predictions = []
+    avg_test_loss = 0
 
-        # Return the mean penalized loss
-        return torch.mean(penalized_loss)
+    for result in cv_results:
+        all_test_actuals.extend(result['test_actuals'])
+        all_test_predictions.extend(result['test_predictions'])
+        avg_test_loss += result['test_loss']
 
-class LabelSmoothingCrossEntropy(nn.Module):
-    def __init__(self, smoothing=0.1):
-        super(LabelSmoothingCrossEntropy, self).__init__()
-        self.smoothing = smoothing
+    avg_test_loss /= len(cv_results)
 
-    def forward(self, outputs, targets):
-        confidence = 1.0 - self.smoothing
-        logprobs = nn.functional.log_softmax(outputs, dim=-1)
-        nll_loss = -logprobs.gather(dim=-1, index=targets.unsqueeze(1))
-        nll_loss = nll_loss.squeeze(1)
-        smooth_loss = -logprobs.mean(dim=-1)
-        loss = confidence * nll_loss + self.smoothing * smooth_loss
-        return loss.mean()
+    # Save and display aggregated results
+    save_and_display_results_classification(all_test_actuals, all_test_predictions, subfolder,
+                                            dataset='test_aggregated')
+
+    # Save average test loss
+    with open(os.path.join(subfolder, 'cv_results.txt'), 'w') as f:
+        f.write(f"Average Test Loss: {avg_test_loss:.6f}\n")
+
+    logging.info(f"Aggregated cross-validation results saved. Average Test Loss: {avg_test_loss:.6f}")
 
 
 def preprocess_data(data: pd.DataFrame, config, data_preprocessor: DataPreprocessor):
@@ -383,14 +376,17 @@ def train_model(model: nn.Module, train_loader, val_loader, criterion, optimizer
 def evaluate_model(model, data_loader, criterion, device):
     model.eval()
     total_loss = 0
+    actuals = []
+    predictions = []
     with torch.no_grad():
         for inputs, volatility, volume, targets in data_loader:
-            inputs, volatility, volume, targets = inputs.to(device), volatility.to(device), volume.to(
-                device), targets.to(device)  # Updated this line
+            inputs, volatility, volume, targets = inputs.to(device), volatility.to(device), volume.to(device), targets.to(device)
             outputs, _ = model(inputs, volatility, volume)
             loss = criterion(outputs, targets)
             total_loss += loss.item()
-    return total_loss / len(data_loader)
+            actuals.extend(targets.cpu().numpy())
+            predictions.extend(torch.argmax(outputs, dim=1).cpu().numpy())
+    return total_loss / len(data_loader), actuals, predictions
 
 
 def evaluate_dollar_difference(model, data_loader, scaler_y, device):
@@ -443,65 +439,79 @@ def main(config_path):
         logging.info("Starting main function")
         logging.info(f"Configuration loaded from: {config_path}")
 
-        # Define paths for datasets
-        datasets = {
-            'train': [os.path.join(project_root, 'data', path) for path in config['train_data']],
-            'val': [os.path.join(project_root, 'data', path) for path in config['val_data']],
-            'test': [os.path.join(project_root, 'data', path) for path in config['test_data']]
-        }
+        # Load all data paths (train, val, test)
+        all_data_paths = config['train_data'] + config['val_data'] + config['test_data']
+        all_data = pd.concat([import_data(os.path.join(project_root, 'data', path)) for path in all_data_paths])
+        all_data = all_data.sort_values('date').reset_index(drop=True)
 
-        processed_data = {}
-        data_loaders = {}
+        # Initialize data preprocessing
         scaler_type = config.get('scaler', 'standard')
         use_pca = config.get('use_pca', False)
         data_preprocessor = DataPreprocessor(scaler_type=scaler_type, use_pca=use_pca)
 
-        # Process each dataset (train, val, test)
-        for dataset_name, data_path in datasets.items():
-            logging.info(f"Processing {dataset_name} dataset from {data_path}")
-            data = import_data(data_path, limit=config.get('data_limit', None))
-            logging.info(f"Data imported for {dataset_name}, shape: {data.shape}")
+        # Preprocess all data
+        all_processed_data, all_volatility, all_volume = preprocess_data(all_data, config, data_preprocessor)
 
-            processed_data[dataset_name], preprocessed_volatility, preprocessed_volume = preprocess_data(data,
-                                                                                                     config,
-                                                                                                     data_preprocessor)
-            logging.info(f"Data preprocessed for {dataset_name}, shape: {processed_data[dataset_name].shape}")
+        # Time series cross-validation
+        cv_results = []
+        for fold, (train_data, val_data, test_data) in enumerate(time_series_cross_validation(all_processed_data)):
+            logging.info(f"Processing fold {fold + 1}")
 
-            dataset = CryptoDataset(processed_data[dataset_name], preprocessed_volatility, preprocessed_volume,
-                                    seq_length=config['seq_length'])
-            data_loaders[dataset_name] = DataLoader(dataset, batch_size=config['batch_size'],
-                                                    shuffle=(dataset_name == 'train'))
-            logging.info(f"DataLoader created for {dataset_name}")
-        input_dim = processed_data['train'].shape[1] - 1  # Exclude target column
-        hidden_dim = config['hidden_dim']
-        num_layers = config['num_layers']
-        dropout = config.get('dropout', 0)
-        use_attention = config['use_attention']
-        num_classes = 3
-        model = LSTMModel(input_dim=input_dim, hidden_dim=hidden_dim, num_layers=num_layers, num_classes=num_classes,
-                          dropout=dropout, use_attention=use_attention)
-        logging.info(f"Model initialized with hidden_dim: {hidden_dim}, num_layers: {num_layers}, dropout: {dropout}")
+            # Create datasets and data loaders for each fold
+            train_dataset = CryptoDataset(train_data, all_volatility[:len(train_data)], all_volume[:len(train_data)], config['seq_length'])
+            val_dataset = CryptoDataset(val_data, all_volatility[len(train_data):len(train_data)+len(val_data)],
+                                        all_volume[len(train_data):len(train_data)+len(val_data)], config['seq_length'])
+            test_dataset = CryptoDataset(test_data, all_volatility[len(train_data)+len(val_data):],
+                                         all_volume[len(train_data)+len(val_data):], config['seq_length'])
 
-        # Define the loss function and optimizer
-        criterion = CrossEntropyLoss()
-        optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'],
-                                     weight_decay=config.get('weight_decay', 0))
-        scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
-        logging.info(f"Loss function, optimizer, and scheduler initialized. Learning rate: {config['learning_rate']}")
+            train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True)
+            val_loader = DataLoader(val_dataset, batch_size=config['batch_size'])
+            test_loader = DataLoader(test_dataset, batch_size=config['batch_size'])
 
-        # Train the model
-        logging.info("Starting model training")
+            # Initialize model, criterion, optimizer, and scheduler
+            input_dim = train_data.shape[1] - 1  # Exclude target column
+            hidden_dim = config['hidden_dim']
+            num_layers = config['num_layers']
+            dropout = config.get('dropout', 0)
+            use_attention = config['use_attention']
+            model = LSTMModel(input_dim=input_dim, hidden_dim=hidden_dim, num_layers=num_layers, num_classes=3,
+                              dropout=dropout, use_attention=use_attention)
+            logging.info(f"Model initialized with hidden_dim: {hidden_dim}, num_layers: {num_layers}, dropout: {dropout}")
 
-        start_time = time.time()
-        train_model(model, data_loaders['train'], data_loaders['val'], criterion, optimizer, scheduler,
-                    config['num_epochs'])
-        end_time = time.time()
-        training_time = end_time - start_time
-        avg_time_per_epoch = training_time / config['num_epochs']
-        logging.info("Model training completed")
+            criterion = CrossEntropyLoss()
+            optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=config.get('weight_decay', 0))
+            scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
+            logging.info(f"Loss function, optimizer, and scheduler initialized. Learning rate: {config['learning_rate']}")
 
-        # Evaluate the model on the test set
-        logging.info("Starting model evaluation on test set")
+            # Train the model for the current fold
+            logging.info(f"Starting model training for fold {fold + 1}")
+            start_time = time.time()
+            train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, config['num_epochs'])
+            end_time = time.time()
+            training_time = end_time - start_time
+            avg_time_per_epoch = training_time / config['num_epochs']
+            logging.info(f"Model training completed for fold {fold + 1}")
+
+            # Evaluate the model on the test set for the current fold
+            logging.info(f"Starting model evaluation on test set for fold {fold + 1}")
+            test_loss, test_actuals, test_predictions = evaluate_model(model, test_loader, criterion, device)
+
+            # Save results for the current fold
+            cv_results.append({
+                'fold': fold + 1,
+                'test_loss': test_loss,
+                'test_actuals': test_actuals,
+                'test_predictions': test_predictions
+            })
+
+            # Save and display results for this fold
+            save_and_display_results_classification(test_actuals, test_predictions, subfolder, dataset=f'test_fold_{fold + 1}')
+
+        # Aggregate and save results across all folds
+        aggregate_and_save_cv_results(cv_results, subfolder)
+        logging.info("Cross-validation completed")
+
+        # Additional evaluations on the final test set (if required)
         model.load_state_dict(torch.load(os.path.join(subfolder, 'best_lstm_model.pth')))
         model.eval()
 
@@ -509,48 +519,20 @@ def main(config_path):
         test_actuals = []
         test_predictions = []
 
-        train_loss = 0.0
-        train_actuals = []
-        train_predictions = []
-
         with torch.no_grad():
-            for X_batch, volatility_batch, volume_batch, y_batch in data_loaders['test']:
-                X_batch, volatility_batch, volume_batch, y_batch = X_batch.to(device), volatility_batch.to(
-                    device), volume_batch.to(device), y_batch.to(device)
+            for X_batch, volatility_batch, volume_batch, y_batch in test_loader:
+                X_batch, volatility_batch, volume_batch, y_batch = X_batch.to(device), volatility_batch.to(device), volume_batch.to(device), y_batch.to(device)
                 y_pred, _ = model(X_batch, volatility_batch, volume_batch)
                 loss = criterion(y_pred, y_batch)
                 test_loss += loss.item()
                 test_actuals.extend(y_batch.cpu().numpy())
                 test_predictions.extend(torch.argmax(y_pred, dim=1).cpu().numpy())
-            for X_batch, volatility_batch, volume_batch, y_batch in data_loaders['train']:
-                X_batch, volatility_batch, volume_batch, y_batch = X_batch.to(device), volatility_batch.to(
-                    device), volume_batch.to(device), y_batch.to(device)
-                y_pred, _ = model(X_batch, volatility_batch, volume_batch)
-                loss = criterion(y_pred, y_batch)
-                train_loss += loss.item()
-                train_actuals.extend(y_batch.cpu().numpy())
-                train_predictions.extend(torch.argmax(y_pred, dim=1).cpu().numpy())
 
-        test_loss /= len(data_loaders['test'])
+        test_loss /= len(test_loader)
         print(f'Test Loss: {test_loss:.6f}')
 
-        train_loss /= len(data_loaders['train'])
-        print(f'Train Loss: {train_loss:.6f}')
-
-        # Save and display results
-
-        logging.info("Saving and displaying results")
         save_and_display_results(test_actuals, test_predictions, subfolder)
-        # average_dollar_difference = evaluate_dollar_difference(model, data_loaders['test'], scaler_y, device)
-        # print(f'Average Dollar Difference: ${average_dollar_difference:.2f}')
-
-        save_experiment_results(
-            training_time, avg_time_per_epoch, test_loss, 0.0,
-            config.get('data_limit', 'N/A'), config.get('use_pca', False), csv_path
-        )
-
-        save_and_display_results_classification(test_actuals, test_predictions, subfolder)
-        save_and_display_results_classification(train_actuals, train_predictions, subfolder, dataset='train')
+        save_experiment_results(training_time, avg_time_per_epoch, test_loss, 0.0, config.get('data_limit', 'N/A'), config.get('use_pca', False), csv_path)
 
     except Exception as e:
         logging.error(f"An error occurred: {str(e)}")
