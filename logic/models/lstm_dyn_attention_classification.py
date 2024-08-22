@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+from sklearn.model_selection import KFold
 from ta import add_all_ta_features
 from torch.nn import CrossEntropyLoss
 from torch.utils.data import Dataset, DataLoader
@@ -198,24 +199,6 @@ def compute_grad_norms(model):
             total_norm += param_norm.item() ** 2
     total_norm = total_norm ** 0.5
     return total_norm
-
-
-def time_series_cross_validation(data, n_splits=10, train_size=6, val_size=2, test_size=2):
-    total_size = len(data)
-    segment_size = total_size // n_splits
-
-    for i in range(n_splits - (train_size + val_size + test_size) + 1):
-        train_start = i * segment_size
-        train_end = (i + train_size) * segment_size
-        val_end = (i + train_size + val_size) * segment_size
-        test_end = (i + train_size + val_size + test_size) * segment_size
-
-        train_data = data[train_start:train_end]
-        val_data = data[train_end:val_end]
-        test_data = data[val_end:test_end]
-
-        yield train_data, val_data, test_data
-
 
 def aggregate_and_save_cv_results(cv_results, subfolder):
     all_test_actuals = []
@@ -437,17 +420,31 @@ def main(config_path):
         logging.info("Starting main function")
         logging.info(f"Configuration loaded from: {config_path}")
 
+        training_time = 0
+        avg_time_per_epoch = 0
+
         all_data_filenames = config['train_data'] + config['val_data'] + config['test_data']
         all_data_paths = [os.path.join(project_root, 'data', path) for path in all_data_filenames]
         all_data = import_data(all_data_paths)
-        all_data = all_data.sort_values('date').reset_index(drop=True) # Probably not necessary
+        all_data = all_data.sort_values('date').reset_index(drop=True)
 
         scaler_type = config.get('scaler', 'standard')
         use_pca = config.get('use_pca', False)
 
+        # Split the data into 5 folds
+        kf = KFold(n_splits=5, shuffle=False)
         cv_results = []
-        for fold, (train_data, val_data, test_data) in enumerate(time_series_cross_validation(all_data)):
+
+        for fold, (train_val_idx, test_idx) in enumerate(kf.split(all_data)):
             logging.info(f"Processing fold {fold + 1}")
+
+            # Split the data
+            train_val_data = all_data.iloc[train_val_idx]
+            test_data = all_data.iloc[test_idx]
+
+            # Further split train_val_data into train and validation
+            train_data = train_val_data.iloc[:int(0.8*len(train_val_data))]
+            val_data = train_val_data.iloc[int(0.8*len(train_val_data)):]
 
             # Initialize a new DataPreprocessor for each fold
             data_preprocessor = DataPreprocessor(scaler_type=scaler_type, use_pca=use_pca)
@@ -508,8 +505,11 @@ def main(config_path):
         aggregate_and_save_cv_results(cv_results, subfolder)
         logging.info("Cross-validation completed")
 
+        # Calculate average test loss across all folds
+        avg_test_loss = sum(result['test_loss'] for result in cv_results) / len(cv_results)
+
         # Save experiment results
-        save_experiment_results(training_time, avg_time_per_epoch, test_loss, 0.0, config.get('data_limit', 'N/A'), config.get('use_pca', False), csv_path)
+        save_experiment_results(training_time, avg_time_per_epoch, avg_test_loss, 0.0, config.get('data_limit', 'N/A'), config.get('use_pca', False), csv_path)
 
     except Exception as e:
         logging.error(f"An error occurred: {str(e)}")
