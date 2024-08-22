@@ -38,7 +38,7 @@ def save_and_display_results(test_actuals, test_predictions, subfolder):
     display_npy_file(predictions_path)
 
 
-def save_and_display_results_classification(test_actuals, test_predictions, subfolder):
+def save_and_display_results_classification(test_actuals, test_predictions, subfolder, dataset='test'):
     """Save and display the results of the classification model."""
 
     # Calculate metrics
@@ -54,7 +54,7 @@ def save_and_display_results_classification(test_actuals, test_predictions, subf
     })
 
     # Save results to CSV
-    results_path = os.path.join(subfolder, 'classification_results.csv')
+    results_path = os.path.join(subfolder, f'classification_results_{dataset}.csv')
     results_df.to_csv(results_path, index=False)
 
     # Save metrics
@@ -62,7 +62,7 @@ def save_and_display_results_classification(test_actuals, test_predictions, subf
         'Metric': ['Accuracy', 'Precision', 'Recall', 'F1-Score'],
         'Value': [accuracy, precision, recall, f1]
     })
-    metrics_path = os.path.join(subfolder, 'classification_metrics.csv')
+    metrics_path = os.path.join(subfolder, f'classification_metrics_{dataset}.csv')
     metrics_df.to_csv(metrics_path, index=False)
 
     # Create and save confusion matrix
@@ -72,7 +72,7 @@ def save_and_display_results_classification(test_actuals, test_predictions, subf
     plt.title('Confusion Matrix')
     plt.xlabel('Predicted')
     plt.ylabel('Actual')
-    cm_path = os.path.join(subfolder, 'confusion_matrix.png')
+    cm_path = os.path.join(subfolder, f'confusion_matrix_{dataset}.png')
     plt.savefig(cm_path)
     plt.close()
 

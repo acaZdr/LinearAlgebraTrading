@@ -105,9 +105,9 @@ def evaluate_ensemble_model(ensemble_model, data_loader, criterion):
     with (torch.no_grad()):
         for X_batch, volatility_batch, volume_batch, y_batch in data_loader:
             X_batch, volatility_batch, volume_batch, y_batch = X_batch.to(device), volatility_batch.to(device), volume_batch.to(device), y_batch.to(device)
-            y_pred, _
+            y_pred = None #samo da ne bi bilo errora
 
-            = ensemble_model(X_batch, volatility_batch, volume_batch)
+            model = ensemble_model(X_batch, volatility_batch, volume_batch)
             loss = criterion(y_pred, y_batch)
             total_loss += loss.item()
 

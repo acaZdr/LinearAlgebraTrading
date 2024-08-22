@@ -3,18 +3,19 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from ta import add_all_ta_features
+from torch.nn import CrossEntropyLoss
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
 import os
 import logging
 import traceback
 import torch.optim.lr_scheduler as lr_scheduler
-from sklearn.decomposition import PCA
 
-from logic.models.abstract_model import set_up_folders, choose_n_components, save_experiment_results
+from logic.models.abstract_model import set_up_folders, save_experiment_results
 from src.data_preprocessing.data_importer import import_data
 from src.utils.config_loader import load_config
 from src.utils.data_saving_and_displaying import save_and_display_results, save_and_display_results_classification
+from src.data_preprocessing.data_preprocessor import DataPreprocessor
 
 from ta.trend import MACD, EMAIndicator
 from ta.momentum import RSIIndicator
@@ -25,7 +26,6 @@ import time
 
 project_root, subfolder = set_up_folders()
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
-print(device.type)
 
 
 class DynamicAttention(nn.Module):
@@ -78,17 +78,7 @@ class LSTMModel(nn.Module):
             nn.Dropout(dropout),
             nn.BatchNorm1d(hidden_dim // 4),
 
-            nn.Linear(hidden_dim // 4, hidden_dim // 8),
-            nn.LeakyReLU(0.01),
-            nn.Dropout(dropout),
-            nn.BatchNorm1d(hidden_dim // 8),
-
-            nn.Linear(hidden_dim // 8, hidden_dim // 16),
-            nn.LeakyReLU(0.01),
-            nn.Dropout(dropout),
-            nn.BatchNorm1d(hidden_dim // 16),
-
-            nn.Linear(hidden_dim // 16, num_classes)
+            nn.Linear(hidden_dim // 4, num_classes)
         )
         #self.softmax = nn.Softmax(dim=1)
 
@@ -97,9 +87,6 @@ class LSTMModel(nn.Module):
         c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).to(x.device)
 
         lstm_out, _ = self.lstm1(x, (h0, c0))
-        lstm_out, _ = self.lstm2(lstm_out)
-        # lstm_out, _ = self.lstm3(lstm_out)
-        # lstm_out, _ = self.lstm4(lstm_out)
 
 
         if self.use_attention:
@@ -203,11 +190,26 @@ def calculate_volatility(data, window_size=20):
     data['volatility'] = data['log_return'].rolling(window=window_size).std()
     return data['volatility'].dropna()
 
+def compute_grad_norms(model):
+    total_norm = 0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            param_norm = p.grad.data.norm(2)
+            total_norm += param_norm.item() ** 2
+    total_norm = total_norm ** 0.5
+    return total_norm
+
+
+# penalty_matrix = torch.tensor([
+#     [0.0, 1.5, 1.0],
+#     [1.0, 0.0, 1.0],
+#     [1.0, 1.5, 0.0]
+# ], device=device)
 
 penalty_matrix = torch.tensor([
-    [0.0, 1.5, 2.0],
+    [0.0, 1.0, 1.0],
     [1.0, 0.0, 1.0],
-    [2.0, 1.5, 0.0]
+    [1.0, 1.0, 0.0]
 ], device=device)
 
 class CustomLoss(nn.Module):
@@ -230,9 +232,22 @@ class CustomLoss(nn.Module):
         # Return the mean penalized loss
         return torch.mean(penalized_loss)
 
+class LabelSmoothingCrossEntropy(nn.Module):
+    def __init__(self, smoothing=0.1):
+        super(LabelSmoothingCrossEntropy, self).__init__()
+        self.smoothing = smoothing
 
-def preprocess_data(data: pd.DataFrame, config, scaler_X=None, scaler_y=None, scaler_volatility=None,
-                    scaler_volume=None, pca=None, fit=False):
+    def forward(self, outputs, targets):
+        confidence = 1.0 - self.smoothing
+        logprobs = nn.functional.log_softmax(outputs, dim=-1)
+        nll_loss = -logprobs.gather(dim=-1, index=targets.unsqueeze(1))
+        nll_loss = nll_loss.squeeze(1)
+        smooth_loss = -logprobs.mean(dim=-1)
+        loss = confidence * nll_loss + self.smoothing * smooth_loss
+        return loss.mean()
+
+
+def preprocess_data(data: pd.DataFrame, config, data_preprocessor: DataPreprocessor):
     target = config['target']
 
     # # Calculate the difference in closing price
@@ -287,32 +302,8 @@ def preprocess_data(data: pd.DataFrame, config, scaler_X=None, scaler_y=None, sc
     X = data[feature_columns].values
     y = data['target'].values
 
-    if not fit:
-        scaler_X = StandardScaler()
-        X_scaled = scaler_X.fit_transform(X)
-        torch.save(scaler_X, os.path.join(subfolder, 'scaler_X.pth'))
-
-        scaler_y = StandardScaler()
-        y_scaled = scaler_y.fit_transform(y.reshape(-1, 1)).flatten()
-        torch.save(scaler_y, os.path.join(subfolder, 'scaler_y.pth'))
-
-        scaler_volatility = StandardScaler()
-        volatility_scaled = scaler_volatility.fit_transform(volatility.values.reshape(-1, 1)).flatten()
-        scaler_volume = StandardScaler()
-        volume_scaled = scaler_volume.fit_transform(volume.values.reshape(-1, 1)).flatten()
-
-        if config.get('use_pca', False):
-            pca = PCA(n_components=choose_n_components(X_scaled))
-            X_scaled = pca.fit_transform(X_scaled)
-            torch.save(pca, os.path.join(subfolder, 'pca.pth'))
-    else:
-        X_scaled = scaler_X.transform(X)
-        y_scaled = scaler_y.transform(y.reshape(-1, 1)).flatten()
-        volatility_scaled = scaler_volatility.transform(volatility.values.reshape(-1, 1)).flatten()
-        volume_scaled = scaler_volume.transform(volume.values.reshape(-1, 1)).flatten()
-
-        if pca is not None:
-            X_scaled = pca.transform(X_scaled)
+    X_scaled, y_scaled, volatility_scaled, volume_scaled = data_preprocessor.fit_transform_data(X, y, volatility, volume,
+                                                                                                subfolder)
 
     logging.info(f"Number of features after preprocessing: {X_scaled.shape[1]}")
 
@@ -322,7 +313,8 @@ def preprocess_data(data: pd.DataFrame, config, scaler_X=None, scaler_y=None, sc
     assert not np.isnan(volatility_scaled).any(), "NaN values found in volatility"
 
     return np.hstack((X_scaled, y_scaled.reshape(-1,
-                                                 1))), volatility_scaled, volume_scaled, scaler_X, scaler_y, scaler_volatility, scaler_volume, pca
+                                                 1))), volatility_scaled, volume_scaled
+
 
 
 def train_model(model: nn.Module, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, patience=5):
@@ -346,6 +338,8 @@ def train_model(model: nn.Module, train_loader, val_loader, criterion, optimizer
             optimizer.step()
             train_loss += loss.item()
 
+        grad_norm = compute_grad_norms(model)
+
         model.eval()
         val_loss = 0
         with torch.no_grad():
@@ -353,16 +347,16 @@ def train_model(model: nn.Module, train_loader, val_loader, criterion, optimizer
                 X_batch, volatility_batch, volume_batch, y_batch = X_batch.to(device), volatility_batch.to(
                     device), volume_batch.to(device), y_batch.to(device)
                 y_pred, _ = model(X_batch, volatility_batch, volume_batch)
+
                 # Ensure no NaN values in model output
                 assert not torch.isnan(y_pred).any(), "NaN values found in model output"
-
                 loss = criterion(y_pred, y_batch)
                 val_loss += loss.item()
 
         train_loss /= len(train_loader)
         val_loss /= len(val_loader)
 
-        print(f'Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}')
+        print(f'Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}, Grad Norm: {grad_norm:.6f}')
 
         scheduler.step(val_loss)
 
@@ -372,10 +366,10 @@ def train_model(model: nn.Module, train_loader, val_loader, criterion, optimizer
             torch.save(model.state_dict(), os.path.join(subfolder, 'best_lstm_model.pth'))
         else:
             patience_counter += 1
-
-        if patience_counter >= patience:
-            logging.info("Early stopping triggered")
-            break
+        #
+        # if patience_counter >= patience:
+        #     logging.info("Early stopping triggered")
+        #     break
 
         # completed_epochs += 1
 
@@ -458,10 +452,9 @@ def main(config_path):
 
         processed_data = {}
         data_loaders = {}
-        scaler_X = None
-        scaler_y = None
-        scaler_volatility = None
-        pca = None
+        scaler_type = config.get('scaler', 'standard')
+        use_pca = config.get('use_pca', False)
+        data_preprocessor = DataPreprocessor(scaler_type=scaler_type, use_pca=use_pca)
 
         # Process each dataset (train, val, test)
         for dataset_name, data_path in datasets.items():
@@ -469,21 +462,9 @@ def main(config_path):
             data = import_data(data_path, limit=config.get('data_limit', None))
             logging.info(f"Data imported for {dataset_name}, shape: {data.shape}")
 
-            if dataset_name == 'train':
-                processed_data[
-                    dataset_name], preprocessed_volatility, preprocessed_volume, scaler_X, scaler_y, scaler_volatility, scaler_volume, pca = preprocess_data(
-                    data, config, fit=False)
-            else:
-                processed_data[
-                    dataset_name], preprocessed_volatility, preprocessed_volume, _, _, _, _, _ = preprocess_data(data,
-                                                                                                                 config,
-                                                                                                                 scaler_X,
-                                                                                                                 scaler_y,
-                                                                                                                 scaler_volatility,
-                                                                                                                 scaler_volume,
-                                                                                                                 pca,
-                                                                                                                 fit=True)
-
+            processed_data[dataset_name], preprocessed_volatility, preprocessed_volume = preprocess_data(data,
+                                                                                                     config,
+                                                                                                     data_preprocessor)
             logging.info(f"Data preprocessed for {dataset_name}, shape: {processed_data[dataset_name].shape}")
 
             dataset = CryptoDataset(processed_data[dataset_name], preprocessed_volatility, preprocessed_volume,
@@ -501,14 +482,8 @@ def main(config_path):
                           dropout=dropout, use_attention=use_attention)
         logging.info(f"Model initialized with hidden_dim: {hidden_dim}, num_layers: {num_layers}, dropout: {dropout}")
 
-        # train_labels = [data_loaders['train'].dataset[i][3].item() for i in range(len(data_loaders['train'].dataset))]
-        # class_counts = torch.bincount(torch.tensor(train_labels))
-        # total_samples = len(train_labels)
-        # class_weights = 1.0 / (class_counts.float() / total_samples)
-        # class_weights = class_weights / class_weights.sum()
-
         # Define the loss function and optimizer
-        criterion = CustomLoss(penalty_matrix)  #weight=class_weights.to(device))
+        criterion = CrossEntropyLoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'],
                                      weight_decay=config.get('weight_decay', 0))
         scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
@@ -529,9 +504,15 @@ def main(config_path):
         logging.info("Starting model evaluation on test set")
         model.load_state_dict(torch.load(os.path.join(subfolder, 'best_lstm_model.pth')))
         model.eval()
-        test_loss = 0
+
+        test_loss = 0.0
         test_actuals = []
         test_predictions = []
+
+        train_loss = 0.0
+        train_actuals = []
+        train_predictions = []
+
         with torch.no_grad():
             for X_batch, volatility_batch, volume_batch, y_batch in data_loaders['test']:
                 X_batch, volatility_batch, volume_batch, y_batch = X_batch.to(device), volatility_batch.to(
@@ -541,22 +522,35 @@ def main(config_path):
                 test_loss += loss.item()
                 test_actuals.extend(y_batch.cpu().numpy())
                 test_predictions.extend(torch.argmax(y_pred, dim=1).cpu().numpy())
+            for X_batch, volatility_batch, volume_batch, y_batch in data_loaders['train']:
+                X_batch, volatility_batch, volume_batch, y_batch = X_batch.to(device), volatility_batch.to(
+                    device), volume_batch.to(device), y_batch.to(device)
+                y_pred, _ = model(X_batch, volatility_batch, volume_batch)
+                loss = criterion(y_pred, y_batch)
+                train_loss += loss.item()
+                train_actuals.extend(y_batch.cpu().numpy())
+                train_predictions.extend(torch.argmax(y_pred, dim=1).cpu().numpy())
+
         test_loss /= len(data_loaders['test'])
         print(f'Test Loss: {test_loss:.6f}')
+
+        train_loss /= len(data_loaders['train'])
+        print(f'Train Loss: {train_loss:.6f}')
 
         # Save and display results
 
         logging.info("Saving and displaying results")
         save_and_display_results(test_actuals, test_predictions, subfolder)
-        average_dollar_difference = evaluate_dollar_difference(model, data_loaders['test'], scaler_y, device)
-        print(f'Average Dollar Difference: ${average_dollar_difference:.2f}')
+        # average_dollar_difference = evaluate_dollar_difference(model, data_loaders['test'], scaler_y, device)
+        # print(f'Average Dollar Difference: ${average_dollar_difference:.2f}')
 
         save_experiment_results(
-            training_time, avg_time_per_epoch, test_loss, average_dollar_difference,
+            training_time, avg_time_per_epoch, test_loss, 0.0,
             config.get('data_limit', 'N/A'), config.get('use_pca', False), csv_path
         )
 
         save_and_display_results_classification(test_actuals, test_predictions, subfolder)
+        save_and_display_results_classification(train_actuals, train_predictions, subfolder, dataset='train')
 
     except Exception as e:
         logging.error(f"An error occurred: {str(e)}")

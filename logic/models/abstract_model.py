@@ -92,26 +92,6 @@ def set_up_folders():
         os.makedirs(subfolder)
     return project_root, subfolder
 
-
-def choose_n_components(X_scaled, variance_threshold=0.95, plot=False):
-    """Choose the number of components for PCA."""
-    pca = PCA().fit(X_scaled)
-    cumulative_variance_ratio = np.cumsum(pca.explained_variance_ratio_)
-    n_components = np.where(cumulative_variance_ratio >= variance_threshold)[0][0] + 1
-    if plot:
-        plt.figure(figsize=(10, 6))
-        plt.plot(cumulative_variance_ratio)
-        plt.xlabel('Number of Components')
-        plt.ylabel('Cumulative Explained Variance')
-        plt.title('Explained Variance vs. Number of Components')
-        plt.axvline(x=n_components, linestyle='--', color='r',
-                    label=f'n_components for {variance_threshold * 100}% variance')
-        plt.legend()
-        plt.show()
-
-    return n_components
-
-
 def evaluate_dollar_difference(model, data_loader, scaler_y, device):
     model.eval()
     total_abs_error = 0
