@@ -243,6 +243,8 @@ def aggregate_and_save_cv_results(cv_results, subfolder):
 def preprocess_data(data: pd.DataFrame, config, data_preprocessor: DataPreprocessor):
     target = config['target']
 
+    data = data.copy()
+
     # # Calculate the difference in closing price
     data['Close_diff'] = data['Close'].diff()
 
@@ -427,49 +429,45 @@ def evaluate_dollar_difference(model, data_loader, scaler_y, device):
 
 
 def main(config_path):
-    # Load configuration
     config = load_config(config_path)
-
-    # Set up logging
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
     csv_path = os.path.join(subfolder, 'times.csv')
 
     try:
         logging.info("Starting main function")
         logging.info(f"Configuration loaded from: {config_path}")
 
-        # Load all data paths (train, val, test)
-        all_data_paths = config['train_data'] + config['val_data'] + config['test_data']
-        all_data = pd.concat([import_data(os.path.join(project_root, 'data', path)) for path in all_data_paths])
-        all_data = all_data.sort_values('date').reset_index(drop=True)
+        all_data_filenames = config['train_data'] + config['val_data'] + config['test_data']
+        all_data_paths = [os.path.join(project_root, 'data', path) for path in all_data_filenames]
+        all_data = import_data(all_data_paths)
+        all_data = all_data.sort_values('date').reset_index(drop=True) # Probably not necessary
 
-        # Initialize data preprocessing
         scaler_type = config.get('scaler', 'standard')
         use_pca = config.get('use_pca', False)
-        data_preprocessor = DataPreprocessor(scaler_type=scaler_type, use_pca=use_pca)
 
-        # Preprocess all data
-        all_processed_data, all_volatility, all_volume = preprocess_data(all_data, config, data_preprocessor)
-
-        # Time series cross-validation
         cv_results = []
-        for fold, (train_data, val_data, test_data) in enumerate(time_series_cross_validation(all_processed_data)):
+        for fold, (train_data, val_data, test_data) in enumerate(time_series_cross_validation(all_data)):
             logging.info(f"Processing fold {fold + 1}")
 
+            # Initialize a new DataPreprocessor for each fold
+            data_preprocessor = DataPreprocessor(scaler_type=scaler_type, use_pca=use_pca)
+
+            # Preprocess each set separately
+            train_processed, train_volatility, train_volume = preprocess_data(train_data, config, data_preprocessor)
+            val_processed, val_volatility, val_volume = preprocess_data(val_data, config, data_preprocessor)
+            test_processed, test_volatility, test_volume = preprocess_data(test_data, config, data_preprocessor)
+
             # Create datasets and data loaders for each fold
-            train_dataset = CryptoDataset(train_data, all_volatility[:len(train_data)], all_volume[:len(train_data)], config['seq_length'])
-            val_dataset = CryptoDataset(val_data, all_volatility[len(train_data):len(train_data)+len(val_data)],
-                                        all_volume[len(train_data):len(train_data)+len(val_data)], config['seq_length'])
-            test_dataset = CryptoDataset(test_data, all_volatility[len(train_data)+len(val_data):],
-                                         all_volume[len(train_data)+len(val_data):], config['seq_length'])
+            train_dataset = CryptoDataset(train_processed, train_volatility, train_volume, config['seq_length'])
+            val_dataset = CryptoDataset(val_processed, val_volatility, val_volume, config['seq_length'])
+            test_dataset = CryptoDataset(test_processed, test_volatility, test_volume, config['seq_length'])
 
             train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True)
             val_loader = DataLoader(val_dataset, batch_size=config['batch_size'])
             test_loader = DataLoader(test_dataset, batch_size=config['batch_size'])
 
             # Initialize model, criterion, optimizer, and scheduler
-            input_dim = train_data.shape[1] - 1  # Exclude target column
+            input_dim = train_processed.shape[1] - 1  # Exclude target column
             hidden_dim = config['hidden_dim']
             num_layers = config['num_layers']
             dropout = config.get('dropout', 0)
@@ -481,7 +479,6 @@ def main(config_path):
             criterion = CrossEntropyLoss()
             optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=config.get('weight_decay', 0))
             scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
-            logging.info(f"Loss function, optimizer, and scheduler initialized. Learning rate: {config['learning_rate']}")
 
             # Train the model for the current fold
             logging.info(f"Starting model training for fold {fold + 1}")
@@ -511,27 +508,7 @@ def main(config_path):
         aggregate_and_save_cv_results(cv_results, subfolder)
         logging.info("Cross-validation completed")
 
-        # Additional evaluations on the final test set (if required)
-        model.load_state_dict(torch.load(os.path.join(subfolder, 'best_lstm_model.pth')))
-        model.eval()
-
-        test_loss = 0.0
-        test_actuals = []
-        test_predictions = []
-
-        with torch.no_grad():
-            for X_batch, volatility_batch, volume_batch, y_batch in test_loader:
-                X_batch, volatility_batch, volume_batch, y_batch = X_batch.to(device), volatility_batch.to(device), volume_batch.to(device), y_batch.to(device)
-                y_pred, _ = model(X_batch, volatility_batch, volume_batch)
-                loss = criterion(y_pred, y_batch)
-                test_loss += loss.item()
-                test_actuals.extend(y_batch.cpu().numpy())
-                test_predictions.extend(torch.argmax(y_pred, dim=1).cpu().numpy())
-
-        test_loss /= len(test_loader)
-        print(f'Test Loss: {test_loss:.6f}')
-
-        save_and_display_results(test_actuals, test_predictions, subfolder)
+        # Save experiment results
         save_experiment_results(training_time, avg_time_per_epoch, test_loss, 0.0, config.get('data_limit', 'N/A'), config.get('use_pca', False), csv_path)
 
     except Exception as e:
