@@ -12,6 +12,7 @@ import logging
 import traceback
 import torch.optim.lr_scheduler as lr_scheduler
 
+from logic.custom_loss import CustomCrossEntropyLoss
 from logic.models.abstract_model import set_up_folders, save_experiment_results
 from src.data_preprocessing.data_importer import import_data
 from src.utils.config_loader import load_config
@@ -110,38 +111,13 @@ class CryptoDataset(Dataset):
     def __init__(self, data, volatility, volume, seq_length):
         self.data = torch.FloatTensor(data[:, :-1])  # Exclude the last column (target)
         self.volatility = torch.FloatTensor(volatility)
-
         self.volume = torch.FloatTensor(volume)
         self.seq_length = seq_length
-        self.labels = torch.LongTensor(self._create_labels(data[:, -1]))
+        self.labels = torch.LongTensor(data[:, -1].astype(int))
 
         expected_length = len(self)
         if len(self.labels) > expected_length:
             self.labels = self.labels[:expected_length]
-
-    def _create_labels(self, target):
-        # Calculate the Simple Moving Average (SMA) over the last 'seq_length' time points
-        sma = np.convolve(target, np.ones(self.seq_length) / self.seq_length, mode='valid')
-
-        # Calculate the difference between the current target value and the SMA
-        diff_to_sma = target[-len(sma):] - sma  # Adjust to match the size of the SMA array
-
-        # Calculate the 33rd and 67th percentiles
-        lower_bound = np.percentile(diff_to_sma, 33)
-        upper_bound = np.percentile(diff_to_sma, 67)
-
-        # Initialize labels array with zeros
-        labels = np.zeros_like(diff_to_sma, dtype=int)
-
-        # Label assignment based on percentile ranges
-        labels[diff_to_sma > upper_bound] = 2  # Top 33% (Bullish)
-        labels[(diff_to_sma >= lower_bound) & (diff_to_sma <= upper_bound)] = 1  # Middle 33% (Neutral)
-        labels[diff_to_sma < lower_bound] = 0  # Bottom 33% (Bearish)
-
-        # print count of each label [0,1,2]
-        logging.info(f"Label counts: {np.bincount(labels)}")
-
-        return labels
 
     def __len__(self):
         return len(self.data) - self.seq_length + 1
@@ -151,7 +127,6 @@ class CryptoDataset(Dataset):
                 self.volatility[idx:idx + self.seq_length],
                 self.volume[idx:idx + self.seq_length],
                 self.labels[idx])
-
 
 def add_custom_ta_features(data):
     # MACD
@@ -229,17 +204,9 @@ def preprocess_data(data: pd.DataFrame, config, data_preprocessor: DataPreproces
     data = data.copy()
 
     # # Calculate the difference in closing price
-    data['Close_diff'] = data['Close'].diff()
+    data['Close_diff'] = data['Close'].pct_change()
 
     data['target'] = data[target].shift(-1)
-
-    #
-    # data['Average_Close_diff'] = data['Close_diff'].abs().rolling(window=26).mean()
-    # # Shift the target to predict the next period's price change
-    # data['target'] = (
-    #         (data['Close_diff'].shift(-1) > 0.05 * data['Average_Close_diff']).astype(int) +
-    #         (data['Close_diff'].shift(-1) < -0.05 * data['Average_Close_diff']).astype(int) * (-1) + 1
-    # ).astype(int)
 
     # Remove the first row which will have NaN for Close_diff
     data = data.dropna().reset_index(drop=True)
@@ -500,6 +467,7 @@ def main(config_path):
 
             # Save and display results for this fold
             save_and_display_results_classification(test_actuals, test_predictions, subfolder, dataset=f'test_fold_{fold + 1}')
+            break
 
         # Aggregate and save results across all folds
         aggregate_and_save_cv_results(cv_results, subfolder)

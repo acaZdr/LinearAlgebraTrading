@@ -2,6 +2,7 @@ import torch
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import os
 from sklearn.decomposition import PCA
+import numpy as np
 
 
 class DataPreprocessor:
@@ -21,6 +22,8 @@ class DataPreprocessor:
 
         self.use_pca = use_pca
         self.pca = None
+        self.quantile_33 = None
+        self.quantile_67 = None
 
         self.fitted = False
 
@@ -31,7 +34,11 @@ class DataPreprocessor:
         X_scaled = self.scaler_X.fit_transform(X)
         torch.save(self.scaler_X, os.path.join(subfolder, 'scaler_X.pth'))
 
-        y_scaled = self.scaler_y.fit_transform(y.reshape(-1, 1)).flatten()
+        self.quantile_33 = np.quantile(y, 0.33)
+        self.quantile_67 = np.quantile(y, 0.67)
+
+        y_quantized = np.digitize(y, [self.quantile_33, self.quantile_67])
+
         torch.save(self.scaler_y, os.path.join(subfolder, 'scaler_Y.pth'))
 
         volatility_scaled = self.scaler_volatility.fit_transform(volatility.values.reshape(-1, 1)).flatten()
@@ -43,13 +50,13 @@ class DataPreprocessor:
             torch.save(self.pca, os.path.join(subfolder, "pca.pth"))
 
         self.fitted = True
-        return X_scaled, y_scaled.reshape(-1, 1), volatility_scaled, volume_scaled
+        return X_scaled, y_quantized, volatility_scaled, volume_scaled
 
     def transform_data(self, X, y, volatility, volume):
         X_scaled = self.scaler_X.transform(X)
-        y_scaled = self.scaler_y.transform(y.reshape(-1, 1)).flatten()
+        y_quantized = np.digitize(y, [self.quantile_33, self.quantile_67])
         volatility_scaled = self.scaler_volatility.transform(volatility.values.reshape(-1, 1)).flatten()
         volume_scaled = self.scaler_volume.transform(volume.values.reshape(-1, 1)).flatten()
         if self.use_pca:
             X_scaled = self.pca.transform(X_scaled)
-        return X_scaled, y_scaled.reshape(-1, 1), volatility_scaled, volume_scaled
+        return X_scaled, y_quantized, volatility_scaled, volume_scaled
