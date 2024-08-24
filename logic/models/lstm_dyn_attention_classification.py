@@ -442,7 +442,7 @@ def main(config_path):
 
             criterion = CrossEntropyLoss()
             optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=config.get('weight_decay', 0))
-            scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
+            scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
 
             # Train the model for the current fold
             logging.info(f"Starting model training for fold {fold + 1}")
