@@ -398,86 +398,66 @@ def main(config_path):
         scaler_type = config.get('scaler', 'standard')
         use_pca = config.get('use_pca', False)
 
-        # Split the data into 5 folds
-        kf = KFold(n_splits=5, shuffle=False)
-        cv_results = []
+        # Split the data: last 20% for test, 20% of remaining for validation, rest for training
+        test_split = int(0.8 * len(all_data))
+        train_val_data = all_data[:test_split]
+        test_data = all_data[test_split:]
 
-        for fold, (train_val_idx, test_idx) in enumerate(kf.split(all_data)):
-            logging.info(f"Processing fold {fold + 1}")
+        val_split = int(0.8 * len(train_val_data))
+        train_data = train_val_data[:val_split]
+        val_data = train_val_data[val_split:]
 
-            # Split the data
-            train_val_data = all_data.iloc[train_val_idx]
-            test_data = all_data.iloc[test_idx]
+        logging.info(f"Data split - Train: {len(train_data)}, Validation: {len(val_data)}, Test: {len(test_data)}")
 
-            # Further split train_val_data into train and validation
-            train_data = train_val_data.iloc[:int(0.8*len(train_val_data))]
-            val_data = train_val_data.iloc[int(0.8*len(train_val_data)):]
+        # Initialize DataPreprocessor
+        data_preprocessor = DataPreprocessor(scaler_type=scaler_type, use_pca=use_pca)
 
-            # Initialize a new DataPreprocessor for each fold
-            data_preprocessor = DataPreprocessor(scaler_type=scaler_type, use_pca=use_pca)
+        # Preprocess each set separately
+        train_processed, train_volatility, train_volume = preprocess_data(train_data, config, data_preprocessor)
+        val_processed, val_volatility, val_volume = preprocess_data(val_data, config, data_preprocessor)
+        test_processed, test_volatility, test_volume = preprocess_data(test_data, config, data_preprocessor)
 
-            # Preprocess each set separately
-            train_processed, train_volatility, train_volume = preprocess_data(train_data, config, data_preprocessor)
-            val_processed, val_volatility, val_volume = preprocess_data(val_data, config, data_preprocessor)
-            test_processed, test_volatility, test_volume = preprocess_data(test_data, config, data_preprocessor)
+        # Create datasets and data loaders
+        train_dataset = CryptoDataset(train_processed, train_volatility, train_volume, config['seq_length'])
+        val_dataset = CryptoDataset(val_processed, val_volatility, val_volume, config['seq_length'])
+        test_dataset = CryptoDataset(test_processed, test_volatility, test_volume, config['seq_length'])
 
-            # Create datasets and data loaders for each fold
-            train_dataset = CryptoDataset(train_processed, train_volatility, train_volume, config['seq_length'])
-            val_dataset = CryptoDataset(val_processed, val_volatility, val_volume, config['seq_length'])
-            test_dataset = CryptoDataset(test_processed, test_volatility, test_volume, config['seq_length'])
+        train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=config['batch_size'])
+        test_loader = DataLoader(test_dataset, batch_size=config['batch_size'])
 
-            train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True)
-            val_loader = DataLoader(val_dataset, batch_size=config['batch_size'])
-            test_loader = DataLoader(test_dataset, batch_size=config['batch_size'])
+        # Initialize model, criterion, optimizer, and scheduler
+        input_dim = train_processed.shape[1] - 1  # Exclude target column
+        hidden_dim = config['hidden_dim']
+        num_layers = config['num_layers']
+        dropout = config.get('dropout', 0)
+        use_attention = config['use_attention']
+        model = LSTMModel(input_dim=input_dim, hidden_dim=hidden_dim, num_layers=num_layers, num_classes=3,
+                          dropout=dropout, use_attention=use_attention)
+        logging.info(f"Model initialized with hidden_dim: {hidden_dim}, num_layers: {num_layers}, dropout: {dropout}")
 
-            # Initialize model, criterion, optimizer, and scheduler
-            input_dim = train_processed.shape[1] - 1  # Exclude target column
-            hidden_dim = config['hidden_dim']
-            num_layers = config['num_layers']
-            dropout = config.get('dropout', 0)
-            use_attention = config['use_attention']
-            model = LSTMModel(input_dim=input_dim, hidden_dim=hidden_dim, num_layers=num_layers, num_classes=3,
-                              dropout=dropout, use_attention=use_attention)
-            logging.info(f"Model initialized with hidden_dim: {hidden_dim}, num_layers: {num_layers}, dropout: {dropout}")
+        criterion = CrossEntropyLoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=config.get('weight_decay', 0))
+        scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
 
-            criterion = CrossEntropyLoss()
-            optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=config.get('weight_decay', 0))
-            scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
+        # Train the model
+        logging.info("Starting model training")
+        start_time = time.time()
+        train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, config['num_epochs'])
+        end_time = time.time()
+        training_time = end_time - start_time
+        avg_time_per_epoch = training_time / config['num_epochs']
+        logging.info("Model training completed")
 
-            # Train the model for the current fold
-            logging.info(f"Starting model training for fold {fold + 1}")
-            start_time = time.time()
-            train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, config['num_epochs'])
-            end_time = time.time()
-            training_time = end_time - start_time
-            avg_time_per_epoch = training_time / config['num_epochs']
-            logging.info(f"Model training completed for fold {fold + 1}")
+        # Evaluate the model on the test set
+        logging.info("Starting model evaluation on test set")
+        test_loss, test_actuals, test_predictions = evaluate_model(model, test_loader, criterion, device)
 
-            # Evaluate the model on the test set for the current fold
-            logging.info(f"Starting model evaluation on test set for fold {fold + 1}")
-            test_loss, test_actuals, test_predictions = evaluate_model(model, test_loader, criterion, device)
-
-            # Save results for the current fold
-            cv_results.append({
-                'fold': fold + 1,
-                'test_loss': test_loss,
-                'test_actuals': test_actuals,
-                'test_predictions': test_predictions
-            })
-
-            # Save and display results for this fold
-            save_and_display_results_classification(test_actuals, test_predictions, subfolder, dataset=f'test_fold_{fold + 1}')
-            break
-
-        # Aggregate and save results across all folds
-        aggregate_and_save_cv_results(cv_results, subfolder)
-        logging.info("Cross-validation completed")
-
-        # Calculate average test loss across all folds
-        avg_test_loss = sum(result['test_loss'] for result in cv_results) / len(cv_results)
+        # Save and display results
+        save_and_display_results_classification(test_actuals, test_predictions, subfolder, dataset='test')
 
         # Save experiment results
-        save_experiment_results(training_time, avg_time_per_epoch, avg_test_loss, 0.0, config.get('data_limit', 'N/A'), config.get('use_pca', False), csv_path)
+        save_experiment_results(training_time, avg_time_per_epoch, test_loss, 0.0, config.get('data_limit', 'N/A'), config.get('use_pca', False), csv_path)
 
     except Exception as e:
         logging.error(f"An error occurred: {str(e)}")
