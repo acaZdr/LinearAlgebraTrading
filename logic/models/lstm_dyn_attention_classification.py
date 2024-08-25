@@ -26,7 +26,6 @@ from ta.volume import OnBalanceVolumeIndicator
 
 import time
 
-project_root, subfolder = set_up_folders()
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
 
 
@@ -301,7 +300,7 @@ def train_model(model: nn.Module, train_loader, val_loader, criterion, optimizer
         train_loss /= len(train_loader)
         val_loss /= len(val_loader)
 
-        print(f'Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}, Grad Norm: {grad_norm:.6f}')
+        logging.info(f'Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}, Grad Norm: {grad_norm:.6f}')
 
         scheduler.step(val_loss)
 
@@ -378,21 +377,48 @@ def evaluate_dollar_difference(model, data_loader, scaler_y, device):
     return average_dollar_diff
 
 
-def main(config_path):
+def setup_logging(subfolder):
+    log_filename = os.path.join(subfolder, f'experiment_log_{time.strftime("%Y%m%d-%H%M%S")}.log')
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_filename),
+            logging.StreamHandler()  # This will also print to console
+        ]
+    )
+    return log_filename
+
+
+def main(config_path, grid_search_run=None):
     config = load_config(config_path)
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    global subfolder
+    global device
+    global project_root
+
+    project_root, subfolder = set_up_folders()
+
+    if grid_search_run is not None:
+        subfolder = os.path.join(subfolder, f'grid_search_{grid_search_run}')
+        os.makedirs(subfolder, exist_ok=True)
+
+    # Setup logging
+    log_filename = setup_logging(subfolder)
+    logging.info(f"Logging to file: {log_filename}")
+
     csv_path = os.path.join(subfolder, 'times.csv')
 
     try:
         logging.info("Starting main function")
         logging.info(f"Configuration loaded from: {config_path}")
+        logging.info(f"Using device: {device}")
 
         training_time = 0
         avg_time_per_epoch = 0
 
         all_data_filenames = config['train_data'] + config['val_data'] + config['test_data']
         all_data_paths = [os.path.join(project_root, 'data', path) for path in all_data_filenames]
-        all_data = import_data(all_data_paths)
+        all_data = import_data(all_data_paths, limit=config.get('data_limit', None))
         all_data = all_data.sort_values('date').reset_index(drop=True)
 
         scaler_type = config.get('scaler', 'standard')
@@ -437,7 +463,8 @@ def main(config_path):
         logging.info(f"Model initialized with hidden_dim: {hidden_dim}, num_layers: {num_layers}, dropout: {dropout}")
 
         criterion = CrossEntropyLoss()
-        optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=config.get('weight_decay', 0))
+        optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'],
+                                     weight_decay=config.get('weight_decay', 0))
         scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
 
         # Train the model
@@ -447,21 +474,26 @@ def main(config_path):
         end_time = time.time()
         training_time = end_time - start_time
         avg_time_per_epoch = training_time / config['num_epochs']
-        logging.info("Model training completed")
+        logging.info(
+            f"Model training completed. Total time: {training_time:.2f}s, Avg time per epoch: {avg_time_per_epoch:.2f}s")
 
         # Evaluate the model on the test set
         logging.info("Starting model evaluation on test set")
         test_loss, test_actuals, test_predictions = evaluate_model(model, test_loader, criterion, device)
+        logging.info(f"Test evaluation completed. Test loss: {test_loss:.4f}")
 
         # Save and display results
         save_and_display_results_classification(test_actuals, test_predictions, subfolder, dataset='test')
+        logging.info("Results saved and displayed")
 
         # Save experiment results
-        save_experiment_results(training_time, avg_time_per_epoch, test_loss, 0.0, config.get('data_limit', 'N/A'), config.get('use_pca', False), csv_path)
+        save_experiment_results(training_time, avg_time_per_epoch, test_loss, 0.0, config.get('data_limit', 'N/A'),
+                                config.get('use_pca', False), csv_path)
+        logging.info("Experiment results saved")
 
     except Exception as e:
         logging.error(f"An error occurred: {str(e)}")
-        traceback.print_exc()
+        logging.error(traceback.format_exc())
 
     logging.info("Main completed")
 
