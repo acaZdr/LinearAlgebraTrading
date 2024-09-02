@@ -12,7 +12,6 @@ import logging
 import traceback
 import torch.optim.lr_scheduler as lr_scheduler
 
-from logic.custom_loss import CustomCrossEntropyLoss
 from logic.models.abstract_model import set_up_folders, save_experiment_results
 from src.data_preprocessing.data_importer import import_data
 from src.utils.config_loader import load_config
@@ -27,6 +26,10 @@ from ta.volume import OnBalanceVolumeIndicator
 import time
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+
+train_processed, train_volatility, train_volume = None, None, None
+val_processed, val_volatility, val_volume = None, None, None
+test_processed, test_volatility, test_volume = None, None, None
 
 
 class DynamicAttention(nn.Module):
@@ -54,10 +57,6 @@ class LSTMModel(nn.Module):
 
         # Time-distributed LSTM layers
         self.lstm1 = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout)
-        self.lstm2 = nn.LSTM(hidden_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout)
-        self.lstm3 = nn.LSTM(hidden_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout)
-        self.lstm4 = nn.LSTM(hidden_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout)
-
 
         self.attention = DynamicAttention(hidden_dim)
 
@@ -107,16 +106,18 @@ class LSTMModel(nn.Module):
 
 
 class CryptoDataset(Dataset):
-    def __init__(self, data, volatility, volume, seq_length):
+    def __init__(self, data, volatility, volume, seq_length, absolute_prices):
         self.data = torch.FloatTensor(data[:, :-1])  # Exclude the last column (target)
         self.volatility = torch.FloatTensor(volatility)
         self.volume = torch.FloatTensor(volume)
         self.seq_length = seq_length
         self.labels = torch.LongTensor(data[:, -1].astype(int))
+        self.absolute_prices = torch.FloatTensor(absolute_prices)
 
         expected_length = len(self)
         if len(self.labels) > expected_length:
-            self.labels = self.labels[:expected_length]
+            self.labels = self.labels[-expected_length:]
+            self.absolute_prices = self.absolute_prices[-expected_length:]
 
     def __len__(self):
         return len(self.data) - self.seq_length + 1
@@ -125,7 +126,8 @@ class CryptoDataset(Dataset):
         return (self.data[idx:idx + self.seq_length],
                 self.volatility[idx:idx + self.seq_length],
                 self.volume[idx:idx + self.seq_length],
-                self.labels[idx])
+                self.labels[idx],
+                self.absolute_prices[idx])
 
 def add_custom_ta_features(data):
     # MACD
@@ -218,6 +220,7 @@ def preprocess_data(data: pd.DataFrame, config, data_preprocessor: DataPreproces
     #                    'rsi_14', 'rsi_21',
     #                    'bb_high', 'bb_low', 'bb_mid', 'bb_width',
     #                    'obv', 'price_roc']
+    absolute_prices = data['Close'].values
 
     data = add_all_ta_features(data, "Open", "High", "Low", "Close", "Volume", fillna=True)
     data = data.dropna().reset_index(drop=True)
@@ -256,12 +259,10 @@ def preprocess_data(data: pd.DataFrame, config, data_preprocessor: DataPreproces
     assert not np.isnan(y_scaled).any(), "NaN values found in target"
     assert not np.isnan(volatility_scaled).any(), "NaN values found in volatility"
 
-    return np.hstack((X_scaled, y_scaled.reshape(-1,
-                                                 1))), volatility_scaled, volume_scaled
+    return np.hstack((X_scaled, y_scaled.reshape(-1, 1))), volatility_scaled, volume_scaled, absolute_prices
 
 
-
-def train_model(model: nn.Module, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, patience=5):
+def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, patience=5):
     model.to(device)
     best_val_loss = float('inf')
     patience_counter = 0
@@ -269,9 +270,8 @@ def train_model(model: nn.Module, train_loader, val_loader, criterion, optimizer
     for epoch in range(num_epochs):
         model.train()
         train_loss = 0
-        for X_batch, volatility_batch, volume_batch, y_batch in train_loader:
-            X_batch, volatility_batch, volume_batch, y_batch = X_batch.to(device), volatility_batch.to(
-                device), volume_batch.to(device), y_batch.to(device)
+        for X_batch, volatility_batch, volume_batch, y_batch, price_batch in train_loader:
+            X_batch, volatility_batch, volume_batch, y_batch = X_batch.to(device), volatility_batch.to(device), volume_batch.to(device), y_batch.to(device)
             optimizer.zero_grad()
             y_pred, _ = model(X_batch, volatility_batch, volume_batch)
 
@@ -287,9 +287,8 @@ def train_model(model: nn.Module, train_loader, val_loader, criterion, optimizer
         model.eval()
         val_loss = 0
         with torch.no_grad():
-            for X_batch, volatility_batch, volume_batch, y_batch in val_loader:
-                X_batch, volatility_batch, volume_batch, y_batch = X_batch.to(device), volatility_batch.to(
-                    device), volume_batch.to(device), y_batch.to(device)
+            for X_batch, volatility_batch, volume_batch, y_batch, price_batch in val_loader:
+                X_batch, volatility_batch, volume_batch, y_batch = X_batch.to(device), volatility_batch.to(device), volume_batch.to(device), y_batch.to(device)
                 y_pred, _ = model(X_batch, volatility_batch, volume_batch)
 
                 # Ensure no NaN values in model output
@@ -310,34 +309,37 @@ def train_model(model: nn.Module, train_loader, val_loader, criterion, optimizer
             torch.save(model.state_dict(), os.path.join(subfolder, 'best_lstm_model.pth'))
         else:
             patience_counter += 1
-        #
-        # if patience_counter >= patience:
-        #     logging.info("Early stopping triggered")
-        #     break
 
-        # completed_epochs += 1
-
-    # end_time = time.time()
-    # duration = end_time - start_time
-    # average_time_per_epoch = duration / completed_epochs if completed_epochs > 0 else 0
-    # print(f"Training completed in {duration:.2f} seconds")
-    # print(f"Average time per epoch: {average_time_per_epoch:.2f} seconds")
-
+        if patience_counter >= patience:
+            logging.info("Early stopping triggered")
+            break
 
 def evaluate_model(model, data_loader, criterion, device):
     model.eval()
     total_loss = 0
     actuals = []
     predictions = []
+    absolute_prices = []
     with torch.no_grad():
-        for inputs, volatility, volume, targets in data_loader:
+        for inputs, volatility, volume, targets, prices in data_loader:
             inputs, volatility, volume, targets = inputs.to(device), volatility.to(device), volume.to(device), targets.to(device)
             outputs, _ = model(inputs, volatility, volume)
             loss = criterion(outputs, targets)
             total_loss += loss.item()
             actuals.extend(targets.cpu().numpy())
             predictions.extend(torch.argmax(outputs, dim=1).cpu().numpy())
-    return total_loss / len(data_loader), actuals, predictions
+            absolute_prices.extend(prices.cpu().numpy())
+    return total_loss / len(data_loader), actuals, predictions, absolute_prices
+
+
+def save_results_with_prices(actuals, predictions, absolute_prices, subfolder, dataset):
+    results_df = pd.DataFrame({
+        'Actual': actuals,
+        'Predicted': predictions,
+        'AbsolutePrice': absolute_prices
+    })
+    results_df.to_csv(os.path.join(subfolder, f'{dataset}_results_with_prices.csv'), index=False)
+    logging.info(f"Results with absolute prices saved to {dataset}_results_with_prices.csv")
 
 
 def evaluate_dollar_difference(model, data_loader, scaler_y, device):
@@ -378,7 +380,9 @@ def evaluate_dollar_difference(model, data_loader, scaler_y, device):
 
 
 def setup_logging(subfolder):
-    log_filename = os.path.join(subfolder, f'experiment_log_{time.strftime("%Y%m%d-%H%M%S")}.log')
+    log_filename = os.path.join(subfolder, f'experiment_log_{time.strftime("%Y%m%d-%H%M")}.log')
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
@@ -392,7 +396,7 @@ def setup_logging(subfolder):
 
 def main(config_path, grid_search_run=None):
     config = load_config(config_path)
-    global subfolder
+    global subfolder, train_processed, train_volatility, test_volume, test_volatility, test_processed, val_volume, val_volatility, val_processed, train_volume
     global device
     global project_root
 
@@ -438,19 +442,22 @@ def main(config_path, grid_search_run=None):
         # Initialize DataPreprocessor
         data_preprocessor = DataPreprocessor(scaler_type=scaler_type, use_pca=use_pca)
 
-        # Preprocess each set separately
-        train_processed, train_volatility, train_volume = preprocess_data(train_data, config, data_preprocessor)
-        val_processed, val_volatility, val_volume = preprocess_data(val_data, config, data_preprocessor)
-        test_processed, test_volatility, test_volume = preprocess_data(test_data, config, data_preprocessor)
+        if train_processed is None:
+            train_processed, train_volatility, train_volume, train_prices = preprocess_data(train_data, config,
+                                                                                            data_preprocessor)
+            val_processed, val_volatility, val_volume, val_prices = preprocess_data(val_data, config, data_preprocessor)
+            test_processed, test_volatility, test_volume, test_prices = preprocess_data(test_data, config,
+                                                                                        data_preprocessor)
 
         # Create datasets and data loaders
-        train_dataset = CryptoDataset(train_processed, train_volatility, train_volume, config['seq_length'])
-        val_dataset = CryptoDataset(val_processed, val_volatility, val_volume, config['seq_length'])
-        test_dataset = CryptoDataset(test_processed, test_volatility, test_volume, config['seq_length'])
+        train_dataset = CryptoDataset(train_processed, train_volatility, train_volume, config['seq_length'],
+                                      train_prices)
+        val_dataset = CryptoDataset(val_processed, val_volatility, val_volume, config['seq_length'], val_prices)
+        test_dataset = CryptoDataset(test_processed, test_volatility, test_volume, config['seq_length'], test_prices)
 
-        train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=config['batch_size'])
-        test_loader = DataLoader(test_dataset, batch_size=config['batch_size'])
+        train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, drop_last=True)
+        val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], drop_last=True)
+        test_loader = DataLoader(test_dataset, batch_size=config['batch_size'], drop_last=True)
 
         # Initialize model, criterion, optimizer, and scheduler
         input_dim = train_processed.shape[1] - 1  # Exclude target column
@@ -479,11 +486,13 @@ def main(config_path, grid_search_run=None):
 
         # Evaluate the model on the test set
         logging.info("Starting model evaluation on test set")
-        test_loss, test_actuals, test_predictions = evaluate_model(model, test_loader, criterion, device)
+        test_loss, test_actuals, test_predictions, test_prices = evaluate_model(model, test_loader, criterion, device)
         logging.info(f"Test evaluation completed. Test loss: {test_loss:.4f}")
 
+        save_results_with_prices(test_actuals, test_predictions, test_prices, subfolder, dataset=f'test_pca_{use_pca}')
+
         # Save and display results
-        save_and_display_results_classification(test_actuals, test_predictions, subfolder, dataset='test')
+        save_and_display_results_classification(test_actuals, test_predictions, subfolder, dataset=f'test_pca_{use_pca}')
         logging.info("Results saved and displayed")
 
         # Save experiment results
