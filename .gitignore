@@ -153,3 +153,4 @@ data
 /results/outputs/test_actuals.npy
 /results/outputs/test_predictions.csv
 /results/outputs/test_predictions.npy
+/results/outputs/
