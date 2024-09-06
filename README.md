@@ -10,7 +10,7 @@ LinearAlgebraTrading is a cryptocurrency trading project that applies linear alg
   - `config.yaml`: Main configuration file that needs to be edited to match the CSV datasets.
   
 - **logic/**: Contains the implementation of the models and files for testing.
-  - `models/lstm_dyn_attention.py`: LSTM model with a dynamic attention mechanism based on volatility (best results so far)
+  - `models/lstm_dyn_attention_classification.py`: LSTM model with a dynamic attention mechanism based on volatility, classification based on the predicted price change percentage
   - `models/lstm.py`: LSTM model with a static attention mechanism for price prediction
   - `models/lin_regression.py`: Linear regression model for price prediction
   
@@ -49,7 +49,7 @@ To run the models, choose one of the following commands:
 - For the LSTM model with attention:
 
 ```bash
-python logic/models/lstm.py
+python logic/models/lstm_dyn_attention_classification.py
 ```
 
 - For the linear regression model:
