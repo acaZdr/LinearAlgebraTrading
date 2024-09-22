@@ -13,6 +13,7 @@ import traceback
 import torch.optim.lr_scheduler as lr_scheduler
 
 from logic.models.abstract_model import set_up_folders, save_experiment_results
+from scripts.calculate_profit import evaluate_strategy
 from src.data_preprocessing.data_importer import import_data
 from src.utils.config_loader import load_config
 from src.utils.data_saving_and_displaying import save_and_display_results, save_and_display_results_classification
@@ -266,6 +267,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
     model.to(device)
     best_val_loss = float('inf')
     patience_counter = 0
+    profit_history = []
 
     for epoch in range(num_epochs):
         model.train()
@@ -284,8 +286,12 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
 
         grad_norm = compute_grad_norms(model)
 
+        # Validation Phase
         model.eval()
         val_loss = 0
+        val_actuals = []
+        val_predictions = []
+        val_prices = []
         with torch.no_grad():
             for X_batch, volatility_batch, volume_batch, y_batch, price_batch in val_loader:
                 X_batch, volatility_batch, volume_batch, y_batch = X_batch.to(device), volatility_batch.to(device), volume_batch.to(device), y_batch.to(device)
@@ -296,23 +302,55 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                 loss = criterion(y_pred, y_batch)
                 val_loss += loss.item()
 
+                val_actuals.extend(y_batch.cpu().numpy())
+                val_predictions.extend(torch.argmax(y_pred, dim=1).cpu().numpy())
+                val_prices.extend(price_batch.cpu().numpy())
+
         train_loss /= len(train_loader)
         val_loss /= len(val_loader)
 
-        logging.info(f'Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}, Grad Norm: {grad_norm:.6f}')
+        # Calculate Average Profit on Validation Set
+        val_results_df = pd.DataFrame({
+            'Predicted': val_predictions,
+            'AbsolutePrice': val_prices
+        })
 
+        # Initialize with a default initial investment, e.g., $1000
+        initial_investment = 1000
+        try:
+            _, total_return, _ = evaluate_strategy(val_results_df, initial_investment)
+            average_profit = total_return * 100  # Convert to percentage
+        except Exception as e:
+            logging.error(f"Error calculating profit: {str(e)}")
+            average_profit = 0.0
+
+        logging.info(f'Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}, Grad Norm: {grad_norm:.6f}, Val Profit: {average_profit:.2f}%')
+
+        profit_history.append({
+            'epoch': epoch + 1,
+            'train_loss': train_loss,
+            'val_loss': val_loss,
+            'grad_norm': grad_norm,
+            'val_profit': average_profit
+        })
+        # Step the scheduler based on validation loss
         scheduler.step(val_loss)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
             torch.save(model.state_dict(), os.path.join(subfolder, 'best_lstm_model.pth'))
+            logging.info(f"Validation loss improved to {best_val_loss:.6f}. Model saved.")
         else:
             patience_counter += 1
+            logging.info(f"No improvement in validation loss for {patience_counter} epoch(s).")
 
         if patience_counter >= patience:
             logging.info("Early stopping triggered")
             break
+    profits_df = pd.DataFrame(profit_history)
+    profits_df.to_csv(os.path.join(subfolder, 'profit_history.csv'), index=False)
+    logging.info("Profit history saved to profit_history.csv")
 
 def evaluate_model(model, data_loader, criterion, device):
     model.eval()
@@ -406,7 +444,6 @@ def main(config_path, grid_search_run=None):
         subfolder = os.path.join(subfolder, f'grid_search_{grid_search_run}')
         os.makedirs(subfolder, exist_ok=True)
 
-    # Setup logging
     log_filename = setup_logging(subfolder)
     logging.info(f"Logging to file: {log_filename}")
 
@@ -437,9 +474,10 @@ def main(config_path, grid_search_run=None):
         train_data = train_val_data[:val_split]
         val_data = train_val_data[val_split:]
 
+        print(f"Validation data profit if buy and hold: {(val_data.iloc[-1][['Close']] / val_data.iloc[0]['Close'] - 1) * 100}%")
+
         logging.info(f"Data split - Train: {len(train_data)}, Validation: {len(val_data)}, Test: {len(test_data)}")
 
-        # Initialize DataPreprocessor
         data_preprocessor = DataPreprocessor(scaler_type=scaler_type, use_pca=use_pca)
 
         if train_processed is None:
