@@ -11,6 +11,8 @@ import os
 import logging
 import traceback
 import torch.optim.lr_scheduler as lr_scheduler
+import torch.nn.functional as F
+
 
 from logic.models.abstract_model import set_up_folders, save_experiment_results
 from src.data_preprocessing.data_importer import import_data
@@ -39,7 +41,7 @@ class DynamicAttention(nn.Module):
         self.attention = nn.Linear(hidden_dim, 1, bias=False)
 
     def forward(self, lstm_out, volatility, volume):
-        # Combine volatility and volume
+
         features = torch.cat((volatility.unsqueeze(-1), volume.unsqueeze(-1)), dim=-1)
         dynamic_weights = torch.tanh(self.feature_layer(features))
         attention_weights = torch.softmax(self.attention(lstm_out * dynamic_weights).squeeze(-1), dim=1)
@@ -55,12 +57,10 @@ class LSTMModel(nn.Module):
         self.num_layers = num_layers
         self.use_attention = use_attention
 
-        # Time-distributed LSTM layers
-        self.lstm1 = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout)
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout)
 
         self.attention = DynamicAttention(hidden_dim)
 
-        # Deeper fully connected layers with Leaky ReLU, Dropout, and BatchNorm
         self.fc_layers = nn.Sequential(
 
             nn.Linear(hidden_dim, hidden_dim),
@@ -86,17 +86,15 @@ class LSTMModel(nn.Module):
         h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).to(x.device)
         c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).to(x.device)
 
-        lstm_out, _ = self.lstm1(x, (h0, c0))
+        lstm_out, _ = self.lstm(x, (h0, c0))
 
 
         if self.use_attention:
             context_vector, attention_weights = self.attention(lstm_out, volatility, volume)
         else:
-            # Uniform attention weights
             seq_len = lstm_out.size(1)
             uniform_attention_weights = torch.ones(lstm_out.size(0), seq_len, device=lstm_out.device) / seq_len
 
-            # Compute context vector using uniform weights
             context_vector = torch.sum(uniform_attention_weights.unsqueeze(-1) * lstm_out, dim=1)
             attention_weights = uniform_attention_weights
 
@@ -107,7 +105,7 @@ class LSTMModel(nn.Module):
 
 class CryptoDataset(Dataset):
     def __init__(self, data, volatility, volume, seq_length, absolute_prices):
-        self.data = torch.FloatTensor(data[:, :-1])  # Exclude the last column (target)
+        self.data = torch.FloatTensor(data[:, :-1])
         self.volatility = torch.FloatTensor(volatility)
         self.volume = torch.FloatTensor(volume)
         self.seq_length = seq_length
@@ -128,6 +126,45 @@ class CryptoDataset(Dataset):
                 self.volume[idx:idx + self.seq_length],
                 self.labels[idx],
                 self.absolute_prices[idx])
+
+class RiskAdjustedPnLLoss(nn.Module):
+    def __init__(self, risk_factor=1.0, pnl_scale=1.0, ce_weight=1.0):
+        super(RiskAdjustedPnLLoss, self).__init__()
+        self.risk_factor = risk_factor
+        self.pnl_scale = pnl_scale
+        self.ce_weight = ce_weight
+        self.cross_entropy = nn.CrossEntropyLoss(reduction='none')
+
+    def forward(self, predictions, targets, prices):
+        # Compute CrossEntropyLoss
+        ce_loss = self.cross_entropy(predictions, targets)
+
+        # Compute PnL
+        predicted_probs = F.softmax(predictions, dim=1)
+        predicted_direction = torch.argmax(predicted_probs, dim=1) - 1
+        actual_direction = targets - 1
+
+        # Calculate price differences
+        price_diffs = prices.diff()
+
+        # Align tensors
+        predicted_probs = predicted_probs[:-1]
+        predicted_direction = predicted_direction[:-1]
+        actual_direction = actual_direction[:-1]
+        ce_loss = ce_loss[:-1]
+
+        # Compute PnL
+        correct_prediction = (predicted_direction == actual_direction).float()
+        pnl = correct_prediction * price_diffs.abs() * self.pnl_scale
+
+        # Compute risk-adjusted PnL
+        risk_adjusted_pnl = pnl / (ce_loss + 1.0)
+
+        # Combine PnL loss with CrossEntropyLoss
+        pnl_loss = -torch.mean(F.logsigmoid(risk_adjusted_pnl))
+        combined_loss = self.ce_weight * torch.mean(ce_loss) + self.risk_factor * pnl_loss
+
+        return combined_loss
 
 def add_custom_ta_features(data):
     # MACD
@@ -188,11 +225,9 @@ def aggregate_and_save_cv_results(cv_results, subfolder):
 
     avg_test_loss /= len(cv_results)
 
-    # Save and display aggregated results
     save_and_display_results_classification(all_test_actuals, all_test_predictions, subfolder,
                                             dataset='test_aggregated')
 
-    # Save average test loss
     with open(os.path.join(subfolder, 'cv_results.txt'), 'w') as f:
         f.write(f"Average Test Loss: {avg_test_loss:.6f}\n")
 
@@ -204,12 +239,10 @@ def preprocess_data(data: pd.DataFrame, config, data_preprocessor: DataPreproces
 
     data = data.copy()
 
-    # # Calculate the difference in closing price
     data['Close_diff'] = data['Close'].pct_change()
 
     data['target'] = data[target].shift(-1)
 
-    # Remove the first row which will have NaN for Close_diff
     data = data.dropna().reset_index(drop=True)
 
     # data = add_custom_ta_features(data)
@@ -234,13 +267,10 @@ def preprocess_data(data: pd.DataFrame, config, data_preprocessor: DataPreproces
 
     logging.info(f"Number of features before PCA: {len(feature_columns)}")
 
-    # Calculate volatility using the new method
     data['volatility'] = calculate_volatility(data, window_size=config.get('volatility_window_size', 20))
 
-    # Drop the close column
     data = data.drop(columns=['Close'])
 
-    # Drop rows with NaN values in volatility
     data = data.dropna().reset_index(drop=True)
 
     volatility = data['volatility']
@@ -254,7 +284,6 @@ def preprocess_data(data: pd.DataFrame, config, data_preprocessor: DataPreproces
 
     logging.info(f"Number of features after preprocessing: {X_scaled.shape[1]}")
 
-    # Ensure no NaN values
     assert not np.isnan(X_scaled).any(), "NaN values found in features"
     assert not np.isnan(y_scaled).any(), "NaN values found in target"
     assert not np.isnan(volatility_scaled).any(), "NaN values found in volatility"
@@ -262,7 +291,8 @@ def preprocess_data(data: pd.DataFrame, config, data_preprocessor: DataPreproces
     return np.hstack((X_scaled, y_scaled.reshape(-1, 1))), volatility_scaled, volume_scaled, absolute_prices
 
 
-def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, patience=5):
+def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, patience=5,
+                max_grad_norm=1.0):
     model.to(device)
     best_val_loss = float('inf')
     patience_counter = 0
@@ -271,14 +301,18 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         model.train()
         train_loss = 0
         for X_batch, volatility_batch, volume_batch, y_batch, price_batch in train_loader:
-            X_batch, volatility_batch, volume_batch, y_batch = X_batch.to(device), volatility_batch.to(device), volume_batch.to(device), y_batch.to(device)
+            X_batch, volatility_batch, volume_batch, y_batch, price_batch = X_batch.to(device), volatility_batch.to(
+                device), volume_batch.to(device), y_batch.to(device), price_batch.to(device)
             optimizer.zero_grad()
             y_pred, _ = model(X_batch, volatility_batch, volume_batch)
 
-            # Ensure no NaN values in model output
             assert not torch.isnan(y_pred).any(), "NaN values found in model output"
-            loss = criterion(y_pred, y_batch)
+            loss = criterion(y_pred, y_batch, price_batch)
             loss.backward()
+
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+
             optimizer.step()
             train_loss += loss.item()
 
@@ -288,18 +322,19 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         val_loss = 0
         with torch.no_grad():
             for X_batch, volatility_batch, volume_batch, y_batch, price_batch in val_loader:
-                X_batch, volatility_batch, volume_batch, y_batch = X_batch.to(device), volatility_batch.to(device), volume_batch.to(device), y_batch.to(device)
+                X_batch, volatility_batch, volume_batch, y_batch, price_batch = X_batch.to(device), volatility_batch.to(
+                    device), volume_batch.to(device), y_batch.to(device), price_batch.to(device)
                 y_pred, _ = model(X_batch, volatility_batch, volume_batch)
 
-                # Ensure no NaN values in model output
                 assert not torch.isnan(y_pred).any(), "NaN values found in model output"
-                loss = criterion(y_pred, y_batch)
+                loss = criterion(y_pred, y_batch, price_batch)
                 val_loss += loss.item()
 
         train_loss /= len(train_loader)
         val_loss /= len(val_loader)
 
-        logging.info(f'Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}, Grad Norm: {grad_norm:.6f}')
+        logging.info(
+            f'Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}, Grad Norm: {grad_norm:.6f}')
 
         scheduler.step(val_loss)
 
@@ -314,6 +349,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             logging.info("Early stopping triggered")
             break
 
+
 def evaluate_model(model, data_loader, criterion, device):
     model.eval()
     total_loss = 0
@@ -322,15 +358,14 @@ def evaluate_model(model, data_loader, criterion, device):
     absolute_prices = []
     with torch.no_grad():
         for inputs, volatility, volume, targets, prices in data_loader:
-            inputs, volatility, volume, targets = inputs.to(device), volatility.to(device), volume.to(device), targets.to(device)
+            inputs, volatility, volume, targets, prices = inputs.to(device), volatility.to(device), volume.to(device), targets.to(device), prices.to(device)
             outputs, _ = model(inputs, volatility, volume)
-            loss = criterion(outputs, targets)
+            loss = criterion(outputs, targets, prices)
             total_loss += loss.item()
             actuals.extend(targets.cpu().numpy())
             predictions.extend(torch.argmax(outputs, dim=1).cpu().numpy())
             absolute_prices.extend(prices.cpu().numpy())
     return total_loss / len(data_loader), actuals, predictions, absolute_prices
-
 
 def save_results_with_prices(actuals, predictions, absolute_prices, subfolder, dataset):
     results_df = pd.DataFrame({
@@ -406,7 +441,6 @@ def main(config_path, grid_search_run=None):
         subfolder = os.path.join(subfolder, f'grid_search_{grid_search_run}')
         os.makedirs(subfolder, exist_ok=True)
 
-    # Setup logging
     log_filename = setup_logging(subfolder)
     logging.info(f"Logging to file: {log_filename}")
 
@@ -428,7 +462,6 @@ def main(config_path, grid_search_run=None):
         scaler_type = config.get('scaler', 'standard')
         use_pca = config.get('use_pca', False)
 
-        # Split the data: last 20% for test, 20% of remaining for validation, rest for training
         test_split = int(0.8 * len(all_data))
         train_val_data = all_data[:test_split]
         test_data = all_data[test_split:]
@@ -439,7 +472,6 @@ def main(config_path, grid_search_run=None):
 
         logging.info(f"Data split - Train: {len(train_data)}, Validation: {len(val_data)}, Test: {len(test_data)}")
 
-        # Initialize DataPreprocessor
         data_preprocessor = DataPreprocessor(scaler_type=scaler_type, use_pca=use_pca)
 
         if train_processed is None:
@@ -449,7 +481,6 @@ def main(config_path, grid_search_run=None):
             test_processed, test_volatility, test_volume, test_prices = preprocess_data(test_data, config,
                                                                                         data_preprocessor)
 
-        # Create datasets and data loaders
         train_dataset = CryptoDataset(train_processed, train_volatility, train_volume, config['seq_length'],
                                       train_prices)
         val_dataset = CryptoDataset(val_processed, val_volatility, val_volume, config['seq_length'], val_prices)
@@ -459,8 +490,7 @@ def main(config_path, grid_search_run=None):
         val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], drop_last=True)
         test_loader = DataLoader(test_dataset, batch_size=config['batch_size'], drop_last=True)
 
-        # Initialize model, criterion, optimizer, and scheduler
-        input_dim = train_processed.shape[1] - 1  # Exclude target column
+        input_dim = train_processed.shape[1] - 1
         hidden_dim = config['hidden_dim']
         num_layers = config['num_layers']
         dropout = config.get('dropout', 0)
@@ -469,12 +499,15 @@ def main(config_path, grid_search_run=None):
                           dropout=dropout, use_attention=use_attention)
         logging.info(f"Model initialized with hidden_dim: {hidden_dim}, num_layers: {num_layers}, dropout: {dropout}")
 
-        criterion = CrossEntropyLoss()
-        optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'],
-                                     weight_decay=config.get('weight_decay', 0))
+        criterion = RiskAdjustedPnLLoss(
+            risk_factor=config.get('risk_factor', 0.5),
+            pnl_scale=config.get('pnl_scale', 0.01),
+            ce_weight=config.get('ce_weight', 1.0)
+        )
+        optimizer = torch.optim.Adam(model.parameters(), lr=config.get('learning_rate', 0.001), weight_decay=config.get('weight_decay', 1e-5))
+
         scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
 
-        # Train the model
         logging.info("Starting model training")
         start_time = time.time()
         train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, config['num_epochs'])
@@ -484,18 +517,15 @@ def main(config_path, grid_search_run=None):
         logging.info(
             f"Model training completed. Total time: {training_time:.2f}s, Avg time per epoch: {avg_time_per_epoch:.2f}s")
 
-        # Evaluate the model on the test set
         logging.info("Starting model evaluation on test set")
         test_loss, test_actuals, test_predictions, test_prices = evaluate_model(model, test_loader, criterion, device)
         logging.info(f"Test evaluation completed. Test loss: {test_loss:.4f}")
 
         save_results_with_prices(test_actuals, test_predictions, test_prices, subfolder, dataset=f'test_pca_{use_pca}')
 
-        # Save and display results
         save_and_display_results_classification(test_actuals, test_predictions, subfolder, dataset=f'test_pca_{use_pca}')
         logging.info("Results saved and displayed")
 
-        # Save experiment results
         save_experiment_results(training_time, avg_time_per_epoch, test_loss, 0.0, config.get('data_limit', 'N/A'),
                                 config.get('use_pca', False), csv_path)
         logging.info("Experiment results saved")
