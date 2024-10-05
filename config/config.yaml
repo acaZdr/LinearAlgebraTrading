@@ -85,35 +85,19 @@ test_data:
   - 'BTCUSDT-3m-2024-03.csv'
   - 'BTCUSDT-3m-2024-04.csv'
   - 'BTCUSDT-3m-2024-05.csv'
-
 download_dir: 'data'
-
-data_limit: 2000
-
-# Preprocessing settings
-scaler: 'standard'
-use_pca: False
-volatility_window_size: 20
+#data_limit: 5000
 target: 'Close_diff'
-
-# Model hyperparameters
-learning_rate: 0.001
-hidden_dim: 128
-attention_head_size: 8
-dropout: 0.1
-hidden_continuous_size: 32
-output_size: 3  # For classification
-
-# TimeSeriesDataSet settings
-max_encoder_length: 60
-max_prediction_length: 10
-
-# Training settings
-num_epochs: 100
+seq_length: 60
 batch_size: 64
-gradient_clip_val: 0.1
+hidden_dim: 32
+num_layers: 3
+learning_rate: 0.00001
+num_epochs: 25
 
-# Callbacks settings
-early_stopping_patience: 10
-min_delta: 1e-4
+use_pca: False
+use_attention: True
+scaler_type: 'standard'
 
+dropout: 0.3
+weight_decay: 0.001

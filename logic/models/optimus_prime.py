@@ -26,22 +26,24 @@ def setup_logging(subfolder):
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
 
-    # Create file handler which logs even debug messages
-    fh = logging.FileHandler(log_filename)
-    fh.setLevel(logging.INFO)
+    # Prevent adding multiple handlers if setup_logging is called multiple times
+    if not logger.handlers:
+        # Create file handler which logs even debug messages
+        fh = logging.FileHandler(log_filename)
+        fh.setLevel(logging.INFO)
 
-    # Create console handler with a higher log level
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(logging.INFO)
+        # Create console handler with a higher log level
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setLevel(logging.INFO)
 
-    # Create formatter and add it to the handlers
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    fh.setFormatter(formatter)
-    ch.setFormatter(formatter)
+        # Create formatter and add it to the handlers
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        fh.setFormatter(formatter)
+        ch.setFormatter(formatter)
 
-    # Add the handlers to the logger
-    logger.addHandler(fh)
-    logger.addHandler(ch)
+        # Add the handlers to the logger
+        logger.addHandler(fh)
+        logger.addHandler(ch)
 
 
 def calculate_volatility(data, window_size=20):
@@ -99,13 +101,17 @@ def preprocess_data(data, config, data_preprocessor, subfolder):
 
     return processed_data, absolute_prices
 
+
 class CryptoTransformer(pl.LightningModule):
     def __init__(self, config, training_data):
         super().__init__()
         self.config = config
         self.training_data = training_data
 
-        loss = CrossEntropy()
+        # Initialize loss function
+        self.loss = CrossEntropy()
+
+        # Initialize the model
         self.model = TemporalFusionTransformer.from_dataset(
             self.training_data,
             learning_rate=self.config['learning_rate'],
@@ -114,30 +120,32 @@ class CryptoTransformer(pl.LightningModule):
             dropout=self.config['dropout'],
             hidden_continuous_size=self.config['hidden_continuous_size'],
             output_size=self.config['output_size'],
-            loss=loss,
+            loss=self.loss,
             logging_metrics=None,
         )
 
         # Ignore 'training_data' and 'model' along with others to avoid warnings
         self.save_hyperparameters(ignore=['training_data', 'model', 'loss', 'logging_metrics'])
+
+        # Move the model to the appropriate device
         self.model = self.model.to(self.device)
 
     def forward(self, x):
-        logging.info(f"Forward input type: {type(x)}")
+        logging.debug(f"Forward input type: {type(x)}")
         if isinstance(x, dict):
             x = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in x.items()}
         elif isinstance(x, tuple):
-            logging.info(f"Forward tuple structure: {[type(item) for item in x]}")
+            logging.debug(f"Forward tuple structure: {[type(item) for item in x]}")
             x = tuple(item.to(self.device) if isinstance(item, torch.Tensor) else item for item in x)
         else:
             x = x.to(self.device)
         return self.model(x)
 
     def training_step(self, batch, batch_idx):
-        logging.info(f"Batch type: {type(batch)}")
-        logging.info(f"Batch structure: {[type(item) for item in batch]}")
+        logging.debug(f"Batch type: {type(batch)}")
+        logging.debug(f"Batch structure: {[type(item) for item in batch]}")
         x, y = batch
-        logging.info(f"x type: {type(x)}, y type: {type(y)}")
+        logging.debug(f"x type: {type(x)}, y type: {type(y)}")
 
         # Move x to the correct device
         if isinstance(x, torch.Tensor):
@@ -147,29 +155,28 @@ class CryptoTransformer(pl.LightningModule):
 
         # Handle y being a list or other non-tensor types
         if isinstance(y, torch.Tensor):
-            y = y.to(self.device)
+            y = y.to(self.device, dtype=torch.long)  # Changed to long for CrossEntropy
         elif isinstance(y, list):
-            y = torch.tensor(y, device=self.device, dtype=torch.float32)  # Adjust dtype as needed
+            y = torch.tensor(y, device=self.device, dtype=torch.long)  # Changed to long
         elif isinstance(y, tuple):
-            y = tuple(item.to(self.device) if isinstance(item, torch.Tensor) else item for item in y)
+            y = tuple(item.to(self.device, dtype=torch.long) if isinstance(item, torch.Tensor) else item for item in y)
         else:
             logging.warning(f"Unsupported type for y: {type(y)}")
             raise TypeError(f"Unsupported type for y: {type(y)}")
 
         outputs = self(x)
-        loss = self.model.loss(outputs, y)
-        self.log('train_loss', loss)
+        loss = self.loss(outputs, y)
+        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         x, y = batch
 
-        # Ensure y is already a tensor; remove unnecessary conversion to torch.tensor
+        # Ensure y is a tensor
         if not isinstance(y, torch.Tensor):
-            y = torch.tensor(y, device=self.device, dtype=torch.float32)
-
-        # If y has multiple elements, ensure correct dimensionality
-        y = y.to(self.device, dtype=torch.float32)
+            y = torch.tensor(y, device=self.device, dtype=torch.long)
+        else:
+            y = y.to(self.device, dtype=torch.long)
 
         # Handle multi-dimensional y if needed
         if y.dim() > 1:
@@ -179,14 +186,28 @@ class CryptoTransformer(pl.LightningModule):
         output = self(x)
 
         # Compute loss
-        loss = self.loss_function(output, y)
+        loss = self.loss(output, y)
 
         # Log validation loss
-        self.log('val_loss', loss)
+        self.log('val_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         return loss
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.config['learning_rate'])
+        # Explicitly setting the optimizer to avoid warnings
+        optimizer_type = self.config.get('optimizer', 'adam').lower()
+        if optimizer_type == 'adam':
+            optimizer = torch.optim.Adam(self.parameters(), lr=self.config['learning_rate'])
+        elif optimizer_type == 'ranger':
+            try:
+                from ranger import Ranger  # Ensure pytorch_optimizer is installed if using 'ranger'
+                optimizer = Ranger(self.parameters(), lr=self.config['learning_rate'])
+            except ImportError:
+                logging.warning("Ranger optimizer not found. Falling back to Adam.")
+                optimizer = torch.optim.Adam(self.parameters(), lr=self.config['learning_rate'])
+        else:
+            raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
+        return optimizer
+
 
 def main(config_path):
     config = load_config(config_path)
@@ -226,11 +247,16 @@ def main(config_path):
         max_encoder_length = config['max_encoder_length']
         max_prediction_length = config['max_prediction_length']
 
-        training_cutoff = train_processed['date'].max() - pd.Timedelta(days=max_prediction_length)
-
-        # Convert 'date' column to Unix timestamp in seconds (or milliseconds)
-        train_processed['time_idx'] = np.arange(len(train_processed))
-        val_processed['time_idx'] = np.arange(len(val_processed))
+        # Ensure continuous time_idx across train, val, test
+        train_processed['time_idx'] = np.arange(max_encoder_length, max_encoder_length + len(train_processed))
+        val_processed['time_idx'] = np.arange(
+            train_processed['time_idx'].max() + 1,
+            train_processed['time_idx'].max() + 1 + len(val_processed)
+        )
+        test_processed['time_idx'] = np.arange(
+            val_processed['time_idx'].max() + 1,
+            val_processed['time_idx'].max() + 1 + len(test_processed)
+        )
 
         training_data = TimeSeriesDataSet(
             train_processed,
@@ -240,7 +266,7 @@ def main(config_path):
             max_encoder_length=max_encoder_length,
             max_prediction_length=max_prediction_length,
             static_categoricals=['group_id'],
-            time_varying_known_reals=['date'],
+            time_varying_known_reals=['time_idx'],  # Changed from 'date' to 'time_idx' for numerical consistency
             time_varying_unknown_reals=[col for col in train_processed.columns if
                                         col not in ['date', 'group_id', 'target']],
             target_normalizer=None,  # No normalization for classification
@@ -248,6 +274,8 @@ def main(config_path):
 
         validation_data = TimeSeriesDataSet.from_dataset(training_data, val_processed, predict=True,
                                                          stop_randomization=True)
+
+        test_data_ts = TimeSeriesDataSet.from_dataset(training_data, test_processed, predict=True, stop_randomization=True)
 
         train_dataloader = training_data.to_dataloader(
             train=True,
@@ -263,39 +291,50 @@ def main(config_path):
             pin_memory=True,
             persistent_workers=True
         )
+        test_dataloader = test_data_ts.to_dataloader(
+            train=False,
+            batch_size=config['batch_size'],
+            num_workers=4,
+            pin_memory=True,
+            persistent_workers=True
+        )
 
         # Initialize model
         model = CryptoTransformer(config, training_data)
 
         # Training
         early_stop_callback = EarlyStopping(monitor="val_loss", min_delta=1e-4, patience=10, verbose=False, mode="min")
-        lr_logger = LearningRateMonitor()
+        lr_logger = LearningRateMonitor(logging_interval='epoch')
         trainer = pl.Trainer(
             max_epochs=config['num_epochs'],
             callbacks=[early_stop_callback, lr_logger],
             accelerator='gpu' if torch.cuda.is_available() else 'cpu',
             devices=1,
             gradient_clip_val=config.get('gradient_clip_val', 0.1),
+            log_every_n_steps=10,
         )
 
         trainer.fit(model, train_dataloader, val_dataloader)
 
         # Evaluation
-        test_data = TimeSeriesDataSet.from_dataset(training_data, test_processed, predict=True, stop_randomization=True)
-        test_dataloader = test_data.to_dataloader(train=False, batch_size=config['batch_size'])
+        predictions = trainer.predict(model, test_dataloader)
 
-        predictions = model.predict(test_dataloader)
+        # Concatenate all predictions and actuals
+        all_predictions = torch.cat(predictions)
+        all_predictions = all_predictions.argmax(dim=-1)
 
-        # Convert predictions to class labels
-        predicted_classes = predictions.argmax(dim=-1)
+        actuals = torch.cat([batch[1].to(model.device) for batch in iter(test_dataloader)])
+        actuals = actuals.view(-1)
+
+        # Ensure actuals are on CPU for numpy conversion
+        actuals_cpu = actuals.cpu()
+        predictions_cpu = all_predictions.cpu()
 
         # Calculate accuracy
-        actuals = torch.cat([y for x, y in iter(test_dataloader)])
-        accuracy = (predicted_classes.view(-1) == actuals.view(-1)).float().mean()
-
+        accuracy = (predictions_cpu == actuals_cpu).float().mean()
         logging.info(f'Test Accuracy: {accuracy:.4f}')
 
-        save_and_display_results_classification(actuals.numpy(), predicted_classes.numpy(), subfolder, dataset='test')
+        save_and_display_results_classification(actuals_cpu.numpy(), predictions_cpu.numpy(), subfolder, dataset='test')
 
     except Exception as e:
         logging.error(f"An error occurred: {str(e)}")

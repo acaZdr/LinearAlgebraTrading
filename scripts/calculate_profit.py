@@ -118,7 +118,7 @@ def calculate_monthly_profits(df: pd.DataFrame, intervals_per_month: int) -> pd.
 
 
 def main():
-    file_path = "../results/outputs/test_pca_True_results_with_prices.csv"
+    file_path = "../results/outputs/test_pca_False_results_with_prices.csv"
     df = read_data(file_path)
 
     if df.empty:

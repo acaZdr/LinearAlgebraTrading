@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import talib
 import torch
 import torch.nn as nn
 from sklearn.model_selection import KFold
@@ -166,7 +167,89 @@ class RiskAdjustedPnLLoss(nn.Module):
 
         return combined_loss
 
+
+def add_chart_patterns(data):
+    """
+    Adds an expanded set of binary features for candlestick chart patterns.
+    Includes both bullish and bearish patterns for more comprehensive signals.
+
+    Parameters:
+    - data (pd.DataFrame): DataFrame containing OHLCV data
+
+    Returns:
+    - pd.DataFrame: DataFrame with additional binary columns for each pattern
+    """
+    # Dictionary of candlestick patterns, grouped by category
+    pattern_funcs = {
+        # Reversal Patterns
+        'CDLDOJI': talib.CDLDOJI,  # Doji - Indecision
+        'CDLHAMMER': talib.CDLHAMMER,  # Hammer - Bullish reversal
+        'CDLINVERTEDHAMMER': talib.CDLINVERTEDHAMMER,  # Inverted Hammer - Potential bullish reversal
+        'CDLSHOOTINGSTAR': talib.CDLSHOOTINGSTAR,  # Shooting Star - Bearish reversal
+        'CDLHANGINGMAN': talib.CDLHANGINGMAN,  # Hanging Man - Bearish reversal
+
+        # Engulfing Patterns
+        'CDLENGULFING': talib.CDLENGULFING,  # Engulfing - Both bullish and bearish
+        'CDLHARAMI': talib.CDLHARAMI,  # Harami - Both bullish and bearish (opposite of engulfing)
+
+        # Multiple Candlestick Patterns
+        'CDLMORNINGSTAR': talib.CDLMORNINGSTAR,  # Morning Star - Bullish reversal
+        'CDLEVENINGSTAR': talib.CDLEVENINGSTAR,  # Evening Star - Bearish reversal
+        'CDL3WHITESOLDIERS': talib.CDL3WHITESOLDIERS,  # Three White Soldiers - Strong bullish reversal
+        'CDL3BLACKCROWS': talib.CDL3BLACKCROWS,  # Three Black Crows - Strong bearish reversal
+
+        # Gap Patterns
+        'CDLXSIDEGAP3METHODS': talib.CDLXSIDEGAP3METHODS,  # Upside/Downside Gap Three Methods
+
+        # Counter-Attack Patterns
+        'CDLCOUNTERATTACK': talib.CDLCOUNTERATTACK,  # Counterattack - Both bullish and bearish
+
+        # Continuation Patterns
+        'CDLRICKSHAWMAN': talib.CDLRICKSHAWMAN,  # Rickshaw Man - High volatility/indecision
+        'CDLSEPARATINGLINES': talib.CDLSEPARATINGLINES,  # Separating Lines - Continuation
+    }
+
+    # Additional pattern combinations for more nuanced signals
+    def add_combined_patterns(data):
+        # Create a copy of the dataframe to avoid fragmentation
+        data = data.copy()
+
+        # Create all pattern columns at once using a dictionary
+        pattern_columns = {
+            'BULLISH_CONFLUENCE': ((data['CDLHAMMER'] == 1) &
+                                   (data['CDLENGULFING'] == 1)),
+            'BEARISH_CONFLUENCE': ((data['CDLSHOOTINGSTAR'] == 1) &
+                                   (data['CDLENGULFING'] == -1)),
+            'STRONG_REVERSAL': ((data['CDLMORNINGSTAR'] == 1) |
+                                (data['CDLEVENINGSTAR'] == -1))
+        }
+
+        # Add all columns at once
+        return pd.concat([data, pd.DataFrame(pattern_columns)], axis=1)
+
+    # Apply individual patterns
+    for pattern_name, pattern_func in pattern_funcs.items():
+        pattern = pattern_func(data['Open'], data['High'], data['Low'], data['Close'])
+
+        # Normalize pattern values to 1 (bullish), -1 (bearish), or 0 (no pattern)
+        data[pattern_name] = np.where(pattern > 0, 1, np.where(pattern < 0, -1, 0))
+
+    # Apply combined patterns
+    data = add_combined_patterns(data)
+
+    # Create a pattern strength indicator
+    bullish_patterns = data[[col for col in data.columns if col.startswith('CDL')]].apply(lambda x: (x == 1).sum(),
+                                                                                          axis=1)
+    bearish_patterns = data[[col for col in data.columns if col.startswith('CDL')]].apply(lambda x: (x == -1).sum(),
+                                                                                          axis=1)
+
+    data['PATTERN_STRENGTH'] = bullish_patterns - bearish_patterns
+
+    return data
+
+
 def add_custom_ta_features(data):
+    # Existing Technical Indicators
     # MACD
     macd = MACD(close=data['Close'])
     data['macd'] = macd.macd()
@@ -195,6 +278,9 @@ def add_custom_ta_features(data):
 
     # Price rate of change
     data['price_roc'] = data['Close'].pct_change(periods=12)
+
+    # Add Chart Patterns
+    data = add_chart_patterns(data)
 
     return data
 
@@ -245,25 +331,30 @@ def preprocess_data(data: pd.DataFrame, config, data_preprocessor: DataPreproces
 
     data = data.dropna().reset_index(drop=True)
 
-    # data = add_custom_ta_features(data)
-    # data = data.dropna().reset_index(drop=True)
-    #
-    # feature_columns = ['macd', 'macd_signal', 'macd_diff',
-    #                    'ema_9', 'ema_21', 'ema_50', 'ema_200',
-    #                    'rsi_14', 'rsi_21',
-    #                    'bb_high', 'bb_low', 'bb_mid', 'bb_width',
-    #                    'obv', 'price_roc']
     absolute_prices = data['Close'].values
 
     data = add_all_ta_features(data, "Open", "High", "Low", "Close", "Volume", fillna=True)
+    data = add_custom_ta_features(data)  # Ensure chart patterns are added here
     data = data.dropna().reset_index(drop=True)
 
     look_ahead_indicators = ['trend_ichimoku_a', 'trend_ichimoku_b', 'trend_visual_ichimoku_a',
                              'trend_visual_ichimoku_b', 'trend_stc', 'trend_psar_up', 'trend_psar_down']
 
+    chart_patterns = [
+        'CDLDOJI', 'CDLHAMMER', 'CDLINVERTEDHAMMER', 'CDLSHOOTINGSTAR', 'CDLHANGINGMAN',
+        'CDLENGULFING', 'CDLHARAMI', 'CDLMORNINGSTAR', 'CDLEVENINGSTAR',
+        'CDL3WHITESOLDIERS', 'CDL3BLACKCROWS', 'CDLXSIDEGAP3METHODS',
+        'CDLCOUNTERATTACK', 'CDLRICKSHAWMAN', 'CDLSEPARATINGLINES',
+        'BULLISH_CONFLUENCE', 'BEARISH_CONFLUENCE', 'STRONG_REVERSAL', 'PATTERN_STRENGTH'
+    ]
+
+    # Make sure to add this to your feature_columns list
     feature_columns = [col for col in data.columns if col not in (
-                ['date', 'Open', 'High', 'Low', 'Close', 'Volume', 'target',
-                 'Average_Close_diff'] + look_ahead_indicators)]
+            ['date', 'Open', 'High', 'Low', 'Close', 'Volume', 'target',
+             'Average_Close_diff'] + look_ahead_indicators)] + chart_patterns
+
+    # Add pattern columns to features
+    feature_columns += chart_patterns
 
     logging.info(f"Number of features before PCA: {len(feature_columns)}")
 
@@ -279,7 +370,8 @@ def preprocess_data(data: pd.DataFrame, config, data_preprocessor: DataPreproces
     X = data[feature_columns].values
     y = data['target'].values
 
-    X_scaled, y_scaled, volatility_scaled, volume_scaled = data_preprocessor.fit_transform_data(X, y, volatility, volume,
+    X_scaled, y_scaled, volatility_scaled, volume_scaled = data_preprocessor.fit_transform_data(X, y, volatility,
+                                                                                                volume,
                                                                                                 subfolder)
 
     logging.info(f"Number of features after preprocessing: {X_scaled.shape[1]}")
@@ -307,7 +399,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             y_pred, _ = model(X_batch, volatility_batch, volume_batch)
 
             assert not torch.isnan(y_pred).any(), "NaN values found in model output"
-            loss = criterion(y_pred, y_batch, price_batch)
+            loss = criterion(y_pred, y_batch)
             loss.backward()
 
             # Gradient clipping
@@ -327,7 +419,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                 y_pred, _ = model(X_batch, volatility_batch, volume_batch)
 
                 assert not torch.isnan(y_pred).any(), "NaN values found in model output"
-                loss = criterion(y_pred, y_batch, price_batch)
+                loss = criterion(y_pred, y_batch)
                 val_loss += loss.item()
 
         train_loss /= len(train_loader)
@@ -360,7 +452,7 @@ def evaluate_model(model, data_loader, criterion, device):
         for inputs, volatility, volume, targets, prices in data_loader:
             inputs, volatility, volume, targets, prices = inputs.to(device), volatility.to(device), volume.to(device), targets.to(device), prices.to(device)
             outputs, _ = model(inputs, volatility, volume)
-            loss = criterion(outputs, targets, prices)
+            loss = criterion(outputs, targets)  # Changed this line
             total_loss += loss.item()
             actuals.extend(targets.cpu().numpy())
             predictions.extend(torch.argmax(outputs, dim=1).cpu().numpy())
@@ -499,11 +591,12 @@ def main(config_path, grid_search_run=None):
                           dropout=dropout, use_attention=use_attention)
         logging.info(f"Model initialized with hidden_dim: {hidden_dim}, num_layers: {num_layers}, dropout: {dropout}")
 
-        criterion = RiskAdjustedPnLLoss(
-            risk_factor=config.get('risk_factor', 0.5),
-            pnl_scale=config.get('pnl_scale', 0.01),
-            ce_weight=config.get('ce_weight', 1.0)
-        )
+        criterion = CrossEntropyLoss()
+        #     RiskAdjustedPnLLoss(
+        #     risk_factor=config.get('risk_factor', 0.5),
+        #     pnl_scale=config.get('pnl_scale', 0.01),
+        #     ce_weight=config.get('ce_weight', 1.0)
+        # ))
         optimizer = torch.optim.Adam(model.parameters(), lr=config.get('learning_rate', 0.001), weight_decay=config.get('weight_decay', 1e-5))
 
         scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
@@ -521,9 +614,9 @@ def main(config_path, grid_search_run=None):
         test_loss, test_actuals, test_predictions, test_prices = evaluate_model(model, test_loader, criterion, device)
         logging.info(f"Test evaluation completed. Test loss: {test_loss:.4f}")
 
-        save_results_with_prices(test_actuals, test_predictions, test_prices, subfolder, dataset=f'test_pca_{use_pca}')
+        save_results_with_prices(test_actuals, test_predictions, test_prices, subfolder, dataset=f'test_pca_patterns_{use_pca}')
 
-        save_and_display_results_classification(test_actuals, test_predictions, subfolder, dataset=f'test_pca_{use_pca}')
+        save_and_display_results_classification(test_actuals, test_predictions, subfolder, dataset=f'test_pca_patterns_{use_pca}')
         logging.info("Results saved and displayed")
 
         save_experiment_results(training_time, avg_time_per_epoch, test_loss, 0.0, config.get('data_limit', 'N/A'),
